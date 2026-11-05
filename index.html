@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>展示空間プランナー</title>
+<script>window.PLANNER_LOCAL = true;try { const t = JSON.parse(localStorage.getItem('planner-prefs') || '{}').theme; if (t) document.documentElement.dataset.theme = t; } catch {}</script>
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "three-mesh-bvh": "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.3/build/index.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<header id="topbar">
+  <div class="brand"><span class="mark">展</span><span class="brand-name">展示空間プランナー</span></div>
+  <div id="topMenus"></div>
+  <span class="tb-sep"></span>
+  <button class="add-btn" id="addBtn"><svg class="i" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg>追加</button>
+  <button class="icon-btn" id="undoBtn" title="元に戻す（Ctrl+Z）"><svg class="i" viewBox="0 0 16 16"><path d="M5.5 4 2.5 7l3 3M3 7h7a3.5 3.5 0 0 1 0 7H8"/></svg></button>
+  <button class="icon-btn" id="redoBtn" title="やり直す（Ctrl+Shift+Z）"><svg class="i" viewBox="0 0 16 16"><path d="m10.5 4 3 3-3 3M13 7H6a3.5 3.5 0 0 0 0 7h2"/></svg></button>
+  <span id="modalText" class="hidden"></span>
+  <div class="spacer"></div>
+  <div class="ctrl-group">
+    <button class="chip" id="orientBtn" title="移動・回転の基準軸">グローバル</button>
+    <span class="chip-pair" title="スナップ（操作中は Ctrl で一時的に切り替え）">
+      <button class="chip on" id="snapBtn"><svg class="i" viewBox="0 0 16 16"><path d="M4 2v6a4 4 0 0 0 8 0V2M4 5h3M9 5h3"/></svg>スナップ</button>
+      <div class="nf center hdr-num" id="snapInc"></div>
+    </span>
+    <span class="chip-pair" title="断面：この高さより上の既存空間を隠す">
+      <button class="chip on" id="clipBtn"><svg class="i" viewBox="0 0 16 16"><path d="M2 10h12M4 13h8M8 2v5M6 5l2 2 2-2"/></svg>断面</button>
+      <div class="nf center hdr-num" id="clipH"></div>
+    </span>
+    <button class="chip on" id="labelsBtn" title="名前と寸法を表示">ラベル</button>
+    <button class="chip" id="xrayBtn" title="既存空間を透かす（Alt+Z）">透視</button>
+  </div>
+  <button class="icon-btn" id="themeBtn" title="ライト／ダーク"><svg class="i" viewBox="0 0 16 16"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7z"/></svg></button>
+  <div id="peers"></div>
+  <div id="conn">未接続</div>
+</header>
+
+<div id="main">
+  <aside class="side" id="leftCol">
+    <div class="side-head">
+      <span class="side-title">オブジェクト</span>
+      <input class="tf osearch" id="oSearch" placeholder="検索">
+    </div>
+    <div id="outliner"></div>
+  </aside>
+
+  <section id="viewArea">
+    <div id="viewport" tabindex="-1">
+      <div id="labels"></div>
+      <div id="sceneTabs"></div>
+      <div id="viewInfo"></div>
+      <div id="navGizmo">
+        <canvas id="gizmoCanvas" width="192" height="192"></canvas>
+        <div class="navrow">
+          <button class="navbtn" id="navZoom" title="ドラッグでズーム"><svg class="i" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14M5 7h4M7 5v4"/></svg></button>
+          <button class="navbtn" id="navPan" title="ドラッグで平行移動"><svg class="i" viewBox="0 0 16 16"><path d="M5 8V3.5a1 1 0 0 1 2 0V7m0-4.5a1 1 0 0 1 2 0V7m0-3.5a1 1 0 0 1 2 0V8m0-2.5a1 1 0 0 1 2 0V10a4.5 4.5 0 0 1-4.5 4.5h-1A4.5 4.5 0 0 1 3 11.5L2 9a1 1 0 0 1 1.8-.8L5 10"/></svg></button>
+          <button class="navbtn" id="navEye" title="目線ビュー（テンキー0）"><svg class="i" viewBox="0 0 16 16"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2"/></svg></button>
+          <button class="navbtn" id="navOrtho" title="透視投影／平行投影（テンキー5）"><svg class="i" viewBox="0 0 16 16"><path d="M2 4h12v8H2zM2 8h12M6 4v8M10 4v8"/></svg></button>
+        </div>
+      </div>
+      <div id="toolbar"></div>
+      <div id="lastOp" class="hidden"><div class="ph"><span id="lastOpTitle"></span><span class="lo-tog">−</span></div><div class="pb" id="lastOpBody"></div></div>
+      <div id="cursor3d"></div>
+      <div id="selRect" class="hidden"></div>
+      <div id="snapMark" class="hidden"></div>
+      <div id="dropHint" class="hidden">ここにドロップして読み込み（3Dデータ・画像）</div>
+      <div id="toast" style="opacity:0"></div>
+      <div id="loading">展示空間を読み込み中…</div>
+    </div>
+  </section>
+
+  <aside class="side" id="rightCol">
+    <div class="rtabs" id="rightTabs">
+      <button class="rtab on" data-tab="props">プロパティ</button>
+      <button class="rtab" data-tab="measure">計測</button>
+      <button class="rtab" data-tab="view">ビュー</button>
+    </div>
+    <div id="rightBody"></div>
+  </aside>
+</div>
+
+<footer id="statusbar"><span id="hints"></span><span class="spacer"></span><span id="stats"></span><div id="vcb" title="操作中に数値を入力して Enter"><span id="vcbL">距離</span><span id="vcbV"></span></div></footer>
+<div id="menuLayer"></div>
+<input type="file" id="fileIn" multiple hidden accept=".glb,.gltf,.obj,.fbx,.stl,.png,.jpg,.jpeg,.webp">
+<input type="file" id="jsonIn" hidden accept=".json,application/json">
+<script type="module" src="app.js"></script>
+</body>
+</html>
