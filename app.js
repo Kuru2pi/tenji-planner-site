@@ -6,6 +6,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
 import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -209,8 +210,7 @@ const helperRoot = new THREE.Group(); scene.add(helperRoot);
     const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([p.clone().negate(), p]), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.7 }));
     helperRoot.add(l);
   }
-  const zl = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new V3(0, 0, 0), new V3(0, 0, 100)]), new THREE.LineBasicMaterial({ color: 0x3e7bfa, transparent: true, opacity: 0.7 }));
-  helperRoot.add(zl);
+
 }
 
 // post-processing: selection outlines (selected = teal, active = light teal)
@@ -265,6 +265,7 @@ function worldPerPixel(p) {
 }
 function leaveScene() { if (activeScene) { activeScene = null; scheduleUI(); } }
 function orbit(dx, dy) {
+  if (sim.follow) { sim.lookYaw -= dx * 0.005; sim.lookPitch = THREE.MathUtils.clamp(sim.lookPitch - dy * 0.005, -1.2, 1.2); return; }   // look around while walking a route
   if (planMode) return pan(dx, dy);   // the plan stays flat: dragging slides it instead
   leaveScene();
   nav.yaw -= dx * 0.006; nav.pitch = THREE.MathUtils.clamp(nav.pitch + dy * 0.006, -Math.PI / 2, Math.PI / 2);
@@ -417,7 +418,7 @@ function syncAll() {
   for (const id of Object.keys(store.rulers)) syncRuler(id);
   scheduleUI(); requestRender();
 }
-const shapeKey = v => [v.type, v.asset?.id, v.unit, v.yup].join('|');
+const shapeKey = v => [v.type, v.asset?.id, v.unit, v.yup, v.type === 'line' || v.type === 'route' ? JSON.stringify([v.points, v.width]) : ''].join('|');
 function disposeHolder(h) {
   h.traverse(o => { if (o.isCSS2DObject) o.element.remove(); if (o.isMesh && o.userData.own) { o.geometry.dispose?.(); } });
   h.removeFromParent();
@@ -437,6 +438,7 @@ function syncObject(id) {
   }
   h.visible = !v.hidden;
   h.traverse(o => {
+    if (o.userData.tintColorOnly) { o.material.color.set(v.color || '#ffffff'); return; }
     if (!o.isMesh || !o.userData.tint) return;
     o.material.color.set(v.color || '#ffffff');
     o.material.opacity = v.opacity ?? 1; o.material.transparent = (v.opacity ?? 1) < 1; o.material.depthWrite = (v.opacity ?? 1) >= 1;
@@ -455,6 +457,8 @@ function buildShape(h, v) {
     const mesh = new THREE.Mesh(geo, mat); mesh.userData.own = true; mesh.userData.tint = true; h.add(mesh);
     h.userData.baseBox = new THREE.Box3(new V3(-0.5, 0, 0), new V3(0.5, 0, aspect));
     loadAsset(v.asset).then(t => { mat.map = t.texture; mat.needsUpdate = true; requestRender(); }).catch(() => { mat.color.set(0xff00ff); });
+  } else if (v.type === 'line' || v.type === 'route') {
+    buildPolyShape(h, v);
   } else if (v.type === 'model') {
     const ph = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0x888888, wireframe: true })); h.add(ph);
     loadAsset(v.asset).then(tpl => {
@@ -481,7 +485,9 @@ function updateLabel(h) {
   const d = dims(h);
   lbl.visible = prefs.labels && h.visible;
   lbl.position.set(0, 0, h.userData.baseBox.max.z);
-  lbl.element.textContent = v.type === 'image' ? `${v.name}  ${fmt(d.x)}×${fmt(d.z)}` : `${v.name}  ${fmt(d.x)}×${fmt(d.y)}×${fmt(d.z)}`;
+  if (v.type === 'line') lbl.element.textContent = `${v.name}  ${fmt(polyLength(v.points))} mm`;
+  else if (v.type === 'route') { const L = polyLength(v.points); lbl.element.textContent = `${v.name}  ${(L).toFixed(1)} m・約${Math.max(1, Math.round(L / (v.speed || 1)))}秒`; }
+  else lbl.element.textContent = v.type === 'image' ? `${v.name}  ${fmt(d.x)}×${fmt(d.z)}` : `${v.name}  ${fmt(d.x)}×${fmt(d.y)}×${fmt(d.z)}`;
   lbl.element.classList.toggle('sel', selected.has('objects:' + h.userData.id));
 }
 
@@ -1018,6 +1024,8 @@ const TOOLS = [
   { id: 'rotate', tip: '回転（Q／R）', icon: '<path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v2.5h-2.5"/>' },
   { id: 'scale', tip: '尺度（S）', icon: '<path d="M2 7V2h5M14 9v5H9M2 2l5 5M14 14 9 9M9 2h5v5"/>' },
   'sep',
+  { id: 'line', tip: 'ライン：床をクリックして点を打ち、ダブルクリックかEnterで終わる（L）', icon: '<path d="M2 12 6.5 6l3.5 4 4-6"/><circle cx="2" cy="12" r="1"/><circle cx="14" cy="4" r="1"/>' },
+  { id: 'route', tip: '導線：人が歩く道すじを描く（P）', icon: '<circle cx="4" cy="3.5" r="1.3"/><path d="M4 6v4l-1.5 4M4 10l1.5 4M9 13.5h2.5a2 2 0 0 0 0-4H9a2 2 0 0 1 0-4h4"/>' },
   { id: 'measure', tip: 'メジャー：ドラッグで2点間を測る（T）', icon: '<path d="M2 11 11 2l3 3-9 9zM5 8l1.5 1.5M7 6l1.5 1.5M9 4l1.5 1.5"/>' },
   { id: 'cursor', tip: '3Dカーソルを置く（Shift+右クリックでも可）', icon: '<path d="M8 2.5 13.5 8 8 13.5 2.5 8z"/><circle cx="8" cy="8" r="1"/>' },
   'sep',
@@ -1027,7 +1035,7 @@ const TOOLS = [
   { id: 'extents', tip: '全体表示（Shift+Z／Home）', action: () => frameAll(), icon: '<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>' },
 ];
 // only three tools on screen; the rest stay on their keys (G R S E O Z …)
-const BAR_TOOLS = [['select', '選択・移動'], ['rotate', '回転'], ['draw', 'ボックスを描く'], ['measure', '測る'], ['erase', '消しゴム']];
+const BAR_TOOLS = [['select', '選択・移動'], ['rotate', '回転'], ['draw', 'ボックス'], ['line', 'ライン'], ['route', '導線'], ['measure', '測る'], ['erase', '消しゴム']];
 function renderToolbar() {
   $('toolbar').innerHTML = BAR_TOOLS.map(([id, label]) => { const t = TOOLS.find(x => x.id === id);
     return `<button class="tool ${tool === id ? 'on' : ''}" data-tool="${id}" title="${t.tip}"><svg class="i" viewBox="0 0 16 16">${t.icon}</svg><span class="t">${label}</span></button>`; }).join('');
@@ -1035,6 +1043,7 @@ function renderToolbar() {
 }
 function setTool(t) {
   if (draw) cancelDraw();
+  if (poly) { poly = null; updatePolyPreview(); }
   tool = t; renderToolbar(); attachGizmo(); setHints();
   renderer.domElement.style.cursor = { measure: 'crosshair', cursor: 'crosshair', draw: 'crosshair', erase: 'not-allowed', orbit: 'grab', pan: 'move', zoom: 'zoom-in' }[t] || 'default';
   if (t === 'measure') { rightTab = 'measure'; scheduleUI(); }
@@ -1257,6 +1266,342 @@ function renderSceneTabs() {
 }
 
 // =====================================================================
+// Floor lines (tape / sign lines) and visitor routes: drawn as polylines on the floor
+// =====================================================================
+const LINE_COLORS = ['#f2c200', '#ffffff', '#3a3936', '#d6453d', '#3e7bfa', '#2fa36b'];
+function polyLength(pts) { let L = 0; for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); return L; }
+function ribbonGeometry(points, w, z = 0.003) {
+  const pos = [], idx = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const [ax, ay] = points[i], [bx, by] = points[i + 1];
+    const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy); if (L < 1e-6) continue;
+    const nx = -dy / L * w / 2, ny = dx / L * w / 2, ex = dx / L * w / 2, ey = dy / L * w / 2;   // extended by w/2 so corners close
+    const k = pos.length / 3;
+    pos.push(ax - ex + nx, ay - ey + ny, z, bx + ex + nx, by + ey + ny, z, bx + ex - nx, by + ey - ny, z, ax - ex - nx, ay - ey - ny, z);
+    idx.push(k, k + 3, k + 2, k, k + 2, k + 1);
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals();
+  return g;
+}
+function arrowGeometry(points, step = 1.6, z = 0.005) {
+  const pos = [], L = polyLength(points);
+  for (let d = step / 2; d < L; d += step) {
+    const { p, dir } = pointAlong(points, d);
+    const n = [-dir[1], dir[0]];
+    pos.push(p[0] + dir[0] * 0.28, p[1] + dir[1] * 0.28, z, p[0] - dir[0] * 0.14 + n[0] * 0.2, p[1] - dir[1] * 0.14 + n[1] * 0.2, z, p[0] - dir[0] * 0.14 - n[0] * 0.2, p[1] - dir[1] * 0.14 - n[1] * 0.2, z);
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.computeVertexNormals();
+  return g;
+}
+function pointAlong(points, d) {
+  for (let i = 1; i < points.length; i++) {
+    const [ax, ay] = points[i - 1], [bx, by] = points[i], L = Math.hypot(bx - ax, by - ay);
+    if (d <= L || i === points.length - 1) { const t = L > 0 ? Math.min(1, Math.max(0, d / L)) : 0; return { p: [ax + (bx - ax) * t, ay + (by - ay) * t], dir: L > 0 ? [(bx - ax) / L, (by - ay) / L] : [1, 0] }; }
+    d -= L;
+  }
+  return { p: points[0], dir: [1, 0] };
+}
+
+// drawing: click points, double-click / Enter to finish, Backspace removes the last point, Esc cancels
+let poly = null;
+const polyLine = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x5b5bd6, depthTest: false, transparent: true }));
+polyLine.renderOrder = 25; polyLine.visible = false; scene.add(polyLine);
+function polyPoint(e) {
+  const s = snapSurface(e, snapping()); if (!s) return null;
+  let p = s.p.clone(); if (poly) p.z = poly.z;
+  if (poly && poly.pts.length) {
+    const last = poly.pts[poly.pts.length - 1];
+    if (e.shiftKey) { if (Math.abs(p.x - last.x) > Math.abs(p.y - last.y)) p.y = last.y; else p.x = last.x; }   // straight along X or Y
+    else if (snapping() && !['vertex', 'mid', 'edge'].includes(s.kind)) {
+      const inc = prefs.snapInc / 1000, d = p.clone().sub(last), L = Math.round(Math.hypot(d.x, d.y) / inc) * inc, a = Math.atan2(d.y, d.x);
+      p.set(last.x + Math.cos(a) * L, last.y + Math.sin(a) * L, p.z);
+    }
+  }
+  return { p, s };
+}
+function updatePolyPreview() {
+  if (!poly) { polyLine.visible = false; requestRender(); return; }
+  const pts = [...poly.pts, ...(poly.cursor ? [poly.cursor] : [])].map(p => p.clone().setZ(p.z + 0.01));
+  polyLine.geometry.dispose(); polyLine.geometry = new THREE.BufferGeometry().setFromPoints(pts);
+  polyLine.material.color.set(poly.kind === 'route' ? 0x5b5bd6 : 0xd4a800); polyLine.visible = pts.length > 1;
+  const L = polyLength(pts.map(p => [p.x, p.y]));
+  setVCB('長さ', fmt(L) + ' mm'); requestRender();
+}
+function polyClick(e) {
+  const r = polyPoint(e); if (!r) return;
+  if (!poly) poly = { kind: tool, pts: [], z: r.p.z };
+  r.p.z = poly.z;
+  if (poly.pts.length && r.p.distanceTo(poly.pts[poly.pts.length - 1]) < 0.03) return finishPoly();   // second click on the same spot = finish
+  poly.pts.push(r.p); updatePolyPreview(); setHints();
+}
+function polyMove(e) {
+  const r = polyPoint(e); showSnapMark(r?.s);
+  if (poly && r) { poly.cursor = r.p; updatePolyPreview(); }
+}
+function finishPoly() {
+  const p = poly; poly = null; updatePolyPreview(); $('snapMark').classList.add('hidden'); setHints();
+  if (!p || p.pts.length < 2) return;
+  const o = p.pts[0], id = rid(), isRoute = p.kind === 'route';
+  const v = newEntity({ type: p.kind, name: nextName(isRoute ? '導線' : 'ライン'), loc: [o.x, o.y, p.z], points: p.pts.map(q => [q.x - o.x, q.y - o.y]),
+    width: isRoute ? 0.5 : 0.05, color: isRoute ? '#5b5bd6' : '#f2c200', opacity: isRoute ? 0.35 : 1, speed: 1.0, people: 5, interval: 3 });
+  commit([{ c: 'objects', id, v }], isRoute ? '導線を描く' : 'ラインを引く');
+  setSelection(['objects:' + id], 'objects:' + id);
+}
+function polyKey(e) {
+  if (e.code === 'Enter' || e.code === 'NumpadEnter') { finishPoly(); return true; }
+  if (e.code === 'Escape') { poly = null; updatePolyPreview(); setHints(); return true; }
+  if (e.code === 'Backspace' || e.code === 'Delete') { poly.pts.pop(); if (!poly.pts.length) poly = null; updatePolyPreview(); return true; }
+  return false;
+}
+function buildPolyShape(h, v) {
+  const ribbon = new THREE.Mesh(ribbonGeometry(v.points, v.width ?? 0.05), new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, transparent: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  ribbon.userData.own = true; ribbon.userData.tint = true; h.add(ribbon);
+  // a hairline on top keeps thin tape lines visible when zoomed out
+  const hair = new THREE.Line(new THREE.BufferGeometry().setFromPoints(v.points.map(([x, y]) => new V3(x, y, 0.006))), new THREE.LineBasicMaterial());
+  hair.userData.tintColorOnly = true; hair.raycast = () => {}; h.add(hair);
+  if (v.type === 'route') {
+    const arrows = new THREE.Mesh(arrowGeometry(v.points), new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
+    arrows.userData.own = true; arrows.userData.tintColorOnly = true; h.add(arrows);
+  }
+  const b = new THREE.Box3(); for (const [x, y] of v.points) b.expandByPoint(new V3(x, y, 0)); b.expandByScalar((v.width ?? 0.05) / 2); b.max.z = 0.01; b.min.z = 0;
+  h.userData.baseBox = b;
+}
+
+// =====================================================================
+// Visitor flow: people walk along a route; you can ride along at eye height
+// =====================================================================
+const sim = { id: null, playing: false, t: 0, last: 0, follow: false, lookYaw: 0, lookPitch: 0, saved: null, fwd: null };
+const walkers = new THREE.Group(); scene.add(walkers);
+const walkerGeo = new THREE.CapsuleGeometry(0.22, 1.24, 4, 12).rotateX(Math.PI / 2).translate(0, 0, 0.85);
+const noseGeo = new THREE.BoxGeometry(0.12, 0.1, 0.1).translate(0.24, 0, 1.55);
+function routeWorld(id) {
+  const v = store.objects[id], h = userHolders.get(id); if (!v || !h) return null;
+  h.updateMatrixWorld(true);
+  return { pts: v.points.map(([x, y]) => { const p = new V3(x, y, 0).applyMatrix4(h.matrixWorld); return [p.x, p.y]; }), z: h.position.z, v };
+}
+function startSim(id, follow = false) {
+  stopSim(true);
+  const v = store.objects[id]; if (!v) return;
+  sim.id = id; sim.playing = true; sim.t = 0; sim.last = performance.now();
+  const n = Math.max(1, Math.min(30, Math.round(v.people || 1)));
+  for (let i = 0; i < n; i++) {
+    const g = new THREE.Group(), mat = new THREE.MeshStandardMaterial({ color: new THREE.Color(v.color || '#5b5bd6').offsetHSL(0, 0, (i % 3) * 0.08 - 0.05), roughness: 0.6 });
+    g.add(new THREE.Mesh(walkerGeo, mat), new THREE.Mesh(noseGeo, mat)); g.visible = false; walkers.add(g);
+  }
+  if (follow) enterFollow();
+  requestAnimationFrame(simLoop); scheduleUI();
+}
+function stopSim(quiet) {
+  if (sim.follow) exitFollow();
+  sim.playing = false; sim.id = null;
+  walkers.children.slice().forEach(g => { g.children[0].material.dispose(); g.removeFromParent(); });
+  requestRender(); if (!quiet) scheduleUI();
+}
+function enterFollow() {
+  if (planMode) setPlanMode(false);
+  sim.saved = navSnapshot(); sim.follow = true; sim.lookYaw = 0; sim.lookPitch = 0; sim.fwd = null;
+  nav.ortho = false; toast('この人の目線で歩いています：ドラッグで見回す／Escで終わる', 4000); setHints();
+}
+function exitFollow() {
+  sim.follow = false;
+  if (sim.saved) { nav.target.fromArray(sim.saved.target); Object.assign(nav, { dist: sim.saved.dist, yaw: sim.saved.yaw, pitch: sim.saved.pitch, ortho: sim.saved.ortho, preset: sim.saved.preset }); updateCamera(); }
+  setHints(); scheduleUI();
+}
+function simLoop(now) {
+  if (!sim.playing) return;
+  const r = routeWorld(sim.id); if (!r || r.pts.length < 2) { stopSim(); return; }
+  const dt = Math.min(0.1, (now - sim.last) / 1000); sim.last = now; sim.t += dt;
+  const L = polyLength(r.pts), speed = Math.max(0.1, r.v.speed || 1), gap = Math.max(0.2, r.v.interval || 3);
+  walkers.children.forEach((g, i) => {
+    const d = (sim.t - i * gap) * speed;
+    if (d < 0) { g.visible = false; return; }
+    const { p, dir } = pointAlong(r.pts, d % L);
+    g.visible = !(sim.follow && i === 0);
+    g.position.set(p[0], p[1], r.z); g.rotation.z = Math.atan2(dir[1], dir[0]);
+  });
+  if (sim.follow) {
+    const d = (sim.t * speed) % L, { p } = pointAlong(r.pts, d), ahead = pointAlong(r.pts, Math.min(L, d + 1.2));
+    const want = new V3(ahead.p[0] - p[0], ahead.p[1] - p[1], 0); if (want.lengthSq() < 1e-6) want.set(...pointAlong(r.pts, d).dir, 0);
+    want.normalize(); sim.fwd = sim.fwd ? sim.fwd.lerp(want, 0.08).normalize() : want;
+    const yaw = Math.atan2(sim.fwd.y, sim.fwd.x) + sim.lookYaw, f = new V3(Math.cos(yaw) * Math.cos(sim.lookPitch), Math.sin(yaw) * Math.cos(sim.lookPitch), Math.sin(sim.lookPitch));
+    const eye = new V3(p[0], p[1], r.z + prefs.eye / 1000);
+    nav.dist = 0.3; nav.yaw = Math.atan2(-f.y, -f.x); nav.pitch = Math.asin(-f.z); nav.target.copy(eye).addScaledVector(f, nav.dist); updateCamera();
+  }
+  requestRender(); requestAnimationFrame(simLoop);
+}
+
+// =====================================================================
+// Three-view drawings (front / right side / top) → 3D model by silhouette carving
+// =====================================================================
+async function fileToCanvas(file, max = 900) {
+  const bmp = await createImageBitmap(file);
+  const s = Math.min(1, max / Math.max(bmp.width, bmp.height)), c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * s); c.height = Math.round(bmp.height * s); c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  return c;
+}
+// foreground = anything that differs clearly from the background colour sampled at the corners (or is opaque on transparent)
+function silhouette(c) {
+  const { width: w, height: h } = c, d = c.getContext('2d').getImageData(0, 0, w, h).data, mask = new Uint8Array(w * h);
+  let br = 0, bg = 0, bb = 0, n = 0, transparent = false;
+  for (const [x0, y0] of [[0, 0], [w - 6, 0], [0, h - 6], [w - 6, h - 6]]) for (let y = y0; y < y0 + 6; y++) for (let x = x0; x < x0 + 6; x++) { const i = (y * w + x) * 4; if (d[i + 3] < 128) transparent = true; br += d[i]; bg += d[i + 1]; bb += d[i + 2]; n++; }
+  br /= n; bg /= n; bb /= n;
+  for (let i = 0; i < w * h; i++) {
+    const a = d[i * 4 + 3];
+    mask[i] = transparent ? a > 128 : a > 128 && Math.hypot(d[i * 4] - br, d[i * 4 + 1] - bg, d[i * 4 + 2] - bb) > 48;
+  }
+  return { w, h, mask, rgb: d };
+}
+function cropView(c, sil, box) {
+  const [x0, y0, x1, y1] = box || bboxOf(sil); if (x1 <= x0 || y1 <= y0) return null;
+  const w = x1 - x0, h = y1 - y0, out = { w, h, mask: new Uint8Array(w * h), rgb: new Uint8ClampedArray(w * h * 4) };
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const si = (y + y0) * sil.w + x + x0, di = y * w + x; out.mask[di] = sil.mask[si];
+    for (let k = 0; k < 4; k++) out.rgb[di * 4 + k] = sil.rgb[si * 4 + k];
+  }
+  const cv = document.createElement('canvas'); cv.width = w; cv.height = h; cv.getContext('2d').drawImage(c, x0, y0, w, h, 0, 0, w, h); out.thumb = cv.toDataURL();
+  return out;
+}
+function bboxOf(sil, region) {
+  let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1; const [rx0, ry0, rx1, ry1] = region || [0, 0, sil.w, sil.h];
+  for (let y = ry0; y < ry1; y++) for (let x = rx0; x < rx1; x++) if (sil.mask[y * sil.w + x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  return [x0, y0, x1 + 1, y1 + 1];
+}
+// one sheet with three views: find the three biggest blobs; the pair side by side is front (left) + side (right), the other one is the top view
+function splitSheet(c) {
+  const sil = silhouette(c), { w, h } = sil, grown = new Uint8Array(w * h), R = Math.max(2, Math.round(Math.max(w, h) / 120));
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (sil.mask[y * w + x])
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) { const X = x + dx, Y = y + dy; if (X >= 0 && Y >= 0 && X < w && Y < h) grown[Y * w + X] = 1; }
+  const lab = new Int32Array(w * h), blobs = [];
+  for (let i = 0; i < w * h; i++) {
+    if (!grown[i] || lab[i]) continue;
+    const id = blobs.length + 1, st = [i]; lab[i] = id; let x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, area = 0;
+    while (st.length) {
+      const j = st.pop(), x = j % w, y = (j / w) | 0; area++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const k of [j - 1, j + 1, j - w, j + w]) if (k >= 0 && k < w * h && grown[k] && !lab[k] && Math.abs((k % w) - x) <= 1) { lab[k] = id; st.push(k); }
+    }
+    blobs.push({ area, box: [x0, y0, x1 + 1, y1 + 1], cx: (x0 + x1) / 2, cy: (y0 + y1) / 2 });
+  }
+  const big = blobs.sort((a, b) => b.area - a.area).slice(0, 3);
+  if (big.length < 3) throw new Error('図が3つ見つかりませんでした。正面・側面・上面を別々に入れてください。');
+  let best = null;
+  for (const [a, b] of [[0, 1], [0, 2], [1, 2]]) { const dy = Math.abs(big[a].cy - big[b].cy); if (!best || dy < best.dy) best = { dy, pair: [big[a], big[b]], other: big[3 - a - b] }; }
+  const [L, Rr] = best.pair.sort((a, b) => a.cx - b.cx);
+  const tight = blob => bboxOf(sil, blob.box);
+  return { front: cropView(c, sil, tight(L)), side: cropView(c, sil, tight(Rr)), top: cropView(c, sil, tight(best.other)) };
+}
+function carve(views, W, D, H, N) {
+  const s = Math.max(W, D, H) / N, nx = Math.max(1, Math.round(W / s)), ny = Math.max(1, Math.round(D / s)), nz = Math.max(1, Math.round(H / s));
+  const inside = (v, u, t) => { if (!v) return true; const x = Math.min(v.w - 1, Math.max(0, (u * v.w) | 0)), y = Math.min(v.h - 1, Math.max(0, (t * v.h) | 0)); return v.mask[y * v.w + x]; };
+  const vox = new Uint8Array(nx * ny * nz), at = (i, j, k) => i >= 0 && j >= 0 && k >= 0 && i < nx && j < ny && k < nz && vox[(k * ny + j) * nx + i];
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const u = (i + .5) / nx, w = (j + .5) / ny, z = (k + .5) / nz;
+    if (inside(views.front, u, 1 - z) && inside(views.side, w, 1 - z) && inside(views.top, u, 1 - w)) vox[(k * ny + j) * nx + i] = 1;
+  }
+  const color = (v, u, t) => { if (!v) return [0.78, 0.76, 0.72]; const x = Math.min(v.w - 1, (u * v.w) | 0), y = Math.min(v.h - 1, (t * v.h) | 0), q = (y * v.w + x) * 4; return [v.rgb[q] / 255, v.rgb[q + 1] / 255, v.rgb[q + 2] / 255]; };
+  const pos = [], col = [], sx = W / nx, sy = D / ny, sz = H / nz;
+  const FACES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    if (!vox[(k * ny + j) * nx + i]) continue;
+    for (const [fx, fy, fz] of FACES) {
+      if (at(i + fx, j + fy, k + fz)) continue;
+      const u = (i + .5) / nx, w = (j + .5) / ny, z = (k + .5) / nz;
+      // blend the three views by the surface direction estimated from neighbouring voxels, so curved sides do not stripe
+      let gx = 0, gy = 0, gz = 0;
+      for (let dz = -2; dz <= 2; dz++) for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if (!at(i + dx, j + dy, k + dz)) { gx += dx; gy += dy; gz += dz; }
+      let gl = Math.hypot(gx, gy, gz); if (gl < 1e-6) { gx = fx; gy = fy; gz = fz; gl = 1; }
+      const wf = Math.abs(gy) / gl, ws = Math.abs(gx) / gl, wt = Math.abs(gz) / gl, ws_ = wf + ws + wt || 1;
+      const cf = color(views.front, u, 1 - z), cs = color(views.side, w, 1 - z), ct = color(views.top, u, 1 - w);
+      const c = [0, 1, 2].map(n => (cf[n] * wf + cs[n] * ws + ct[n] * wt) / ws_);
+      // face quad corners in voxel space
+      const cx = i + .5 + fx * .5, cy = j + .5 + fy * .5, cz = k + .5 + fz * .5;
+      const a = fx ? [0, 1, 0] : [1, 0, 0], b = fz ? [0, 1, 0] : [0, 0, 1];
+      const q = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([m, n]) => [(cx + (a[0] * m + b[0] * n) * .5) * sx - W / 2, (cy + (a[1] * m + b[1] * n) * .5) * sy - D / 2, (cz + (a[2] * m + b[2] * n) * .5) * sz]);
+      const flip = (fx + fy + fz) * ((fx ? 1 : 0) + (fz ? 1 : 0) - (fy ? 1 : 0)) < 0;
+      const tri = flip ? [0, 2, 1, 0, 3, 2] : [0, 1, 2, 0, 2, 3];
+      for (const t of tri) { pos.push(...q[t]); col.push(...c); }
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  return g;
+}
+function threeViewDialog() {
+  const views = { front: null, side: null, top: null };
+  const bg = document.createElement('div'); bg.className = 'dialog-bg';
+  bg.innerHTML = `<div class="dialog tv-dialog">
+    <h3>三面図から3Dモデルを作る</h3>
+    <p class="note">三面図を1枚まとめて入れると、自動で正面・側面・上面に切り分けます（第三角法：上面は正面の上、右側面は正面の右）。別々の画像なら、それぞれの枠に入れてください。背景は白か透明にしてください。</p>
+    <div class="tv-sheet" data-slot="sheet">三面図1枚をここにドロップ（またはクリック）</div>
+    <div class="tv-grid">
+      <div class="tv-slot" data-slot="top"><b>上面図</b><span>ドロップ／クリック</span></div>
+      <div class="tv-slot" data-slot="front"><b>正面図</b><span>ドロップ／クリック</span></div>
+      <div class="tv-slot" data-slot="side"><b>右側面図</b><span>ドロップ／クリック</span></div>
+    </div>
+    <div class="tv-dims">
+      <label>高さ（mm）<input class="tf" id="tvH" value="1000"></label>
+      <label>幅（mm）<input class="tf" id="tvW" value=""></label>
+      <label>奥行（mm）<input class="tf" id="tvD" value=""></label>
+      <label>細かさ <select class="sf" id="tvN"><option value="64">標準</option><option value="96">細かい</option><option value="128">とても細かい</option></select></label>
+    </div>
+    <div class="note">幅と奥行は、高さと図の縦横比から自動で計算します（数字を直すこともできます）。</div>
+    <div class="btns" style="justify-content:flex-end;margin-top:12px"><button class="btn" data-r="0">キャンセル</button><button class="btn primary" data-r="1" disabled>3Dモデルを作る</button></div>
+  </div>`;
+  const $$ = s => bg.querySelector(s), make = $$('[data-r="1"]');
+  const pick = () => new Promise(res => { const i = document.createElement('input'); i.type = 'file'; i.accept = 'image/*'; i.onchange = () => res(i.files[0]); i.click(); });
+  const ratio = v => v ? v.w / v.h : null;
+  let manualW = false, manualD = false;
+  const recalc = () => {
+    const H = parseFloat($$('#tvH').value) || 1000;
+    if (!manualW && ratio(views.front)) $$('#tvW').value = Math.round(H * ratio(views.front));
+    if (!manualD && ratio(views.side)) $$('#tvD').value = Math.round(H * ratio(views.side));
+    else if (!manualD && ratio(views.top) && parseFloat($$('#tvW').value)) $$('#tvD').value = Math.round(parseFloat($$('#tvW').value) / ratio(views.top));
+    make.disabled = !(views.front || views.side || views.top);
+  };
+  const show = () => {
+    for (const k of ['front', 'side', 'top']) { const el = $$(`[data-slot="${k}"]`); el.classList.toggle('on', !!views[k]); el.style.backgroundImage = views[k] ? `url(${views[k].thumb})` : ''; }
+    recalc();
+  };
+  const take = async (slot, file) => {
+    if (!file) return;
+    try {
+      const c = await fileToCanvas(file);
+      if (slot === 'sheet') Object.assign(views, splitSheet(c));
+      else { const sil = silhouette(c); views[slot] = cropView(c, sil); }
+      show();
+    } catch (err) { toast(err.message, 4000); }
+  };
+  bg.querySelectorAll('[data-slot]').forEach(el => {
+    el.onclick = async () => take(el.dataset.slot, await pick());
+    el.ondragover = e => { e.preventDefault(); el.classList.add('drag'); };
+    el.ondragleave = () => el.classList.remove('drag');
+    el.ondrop = e => { e.preventDefault(); e.stopPropagation(); el.classList.remove('drag'); take(el.dataset.slot, e.dataTransfer.files[0]); };
+  });
+  $$('#tvH').oninput = recalc; $$('#tvW').oninput = () => { manualW = true; }; $$('#tvD').oninput = () => { manualD = true; };
+  bg.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') bg.remove(); });
+  $$('[data-r="0"]').onclick = () => bg.remove();
+  make.onclick = async () => {
+    const H = (parseFloat($$('#tvH').value) || 1000) / 1000, W = (parseFloat($$('#tvW').value) || H * 1000) / 1000, D = (parseFloat($$('#tvD').value) || W * 1000) / 1000;
+    make.disabled = true; make.textContent = '作成中…';
+    await new Promise(r => setTimeout(r, 30));
+    try {
+      const geo = carve(views, W, D, H, parseInt($$('#tvN').value, 10));
+      if (!geo.attributes.position.count) throw new Error('形が取り出せませんでした。背景が白か透明になっているか確認してください。');
+      const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.7 })); mesh.name = '作品';
+      const glb = await new GLTFExporter().parseAsync(mesh, { binary: true });
+      const file = new File([glb], '作品（三面図）.glb', { type: 'model/gltf-binary' });
+      const up = await uploadAsset(file), id = rid();
+      assetCache.set(up.id, Promise.resolve(mesh));
+      commit([{ c: 'objects', id, v: newEntity({ type: 'model', name: nextName('作品'), asset: { id: up.id, name: file.name, ext: 'glb' }, unit: 1, yup: false, color: null }) }], '三面図から3Dモデルを作る');
+      setSelection(['objects:' + id], 'objects:' + id);
+      bg.remove(); toast(`3Dモデルを作りました（${fmt(W)} × ${fmt(D)} × ${fmt(H)} mm）`, 4000);
+    } catch (err) { console.error(err); toast(err.message, 5000); make.disabled = false; make.textContent = '3Dモデルを作る'; }
+  };
+  document.body.appendChild(bg);
+}
+
+// =====================================================================
 // Pointer input on the viewport
 // =====================================================================
 let drag = null;   // {kind, x, y, ...}
@@ -1280,6 +1625,7 @@ canvas.addEventListener('pointerdown', e => {
   if (tc.object && (tc.dragging || tc.axis)) return;      // gizmo handles it
   if (tool === 'orbit' || tool === 'pan' || tool === 'zoom') { drag = { kind: tool, x: e.clientX, y: e.clientY }; canvas.setPointerCapture(e.pointerId); return; }
   if (tool === 'draw') { drawClick(e); return; }
+  if (tool === 'line' || tool === 'route') { polyClick(e); return; }
   if (tool === 'erase') { drag = { kind: 'erase', x: e.clientX, y: e.clientY }; return; }
   if (tool === 'cursor') { const s = snapSurface(e, snapping()); if (s) setCursor(s.p, s.hit ? hitNormal(s.hit) : null); requestRender(); return; }
   if (tool === 'measure') {
@@ -1310,6 +1656,7 @@ canvas.addEventListener('pointermove', e => {
   if (modal) { modal.mouse = localXY(e); updateModal(); return; }
   if (!drag) {
     if (tool === 'draw' && draw) { drawMove(e); return; }
+    if (tool === 'line' || tool === 'route') { polyMove(e); return; }
     if (tool === 'measure' || tool === 'draw' || tool === 'cursor') showSnapMark(snapSurface(e, snapping()));
     else if (tool === 'select' || tool === 'move') canvas.style.cursor = raycastAll(e, { selectable: true }) ? 'grab' : 'default';   // show what can be dragged
     return;
@@ -1506,6 +1853,8 @@ window.addEventListener('keydown', e => {
     return;
   }
   if (draw && tool === 'draw' && !mod && drawKey(e)) { e.preventDefault(); return; }
+  if (poly && !mod && polyKey(e)) { e.preventDefault(); return; }
+  if (e.code === 'Escape' && sim.follow) { exitFollow(); return; }
   if (e.code === 'Escape') { closeMenus(); if (drag?.kind === 'ruler') { drag = null; hideTempRuler(); } return; }
   if (mod && e.code === 'KeyZ') { e.preventDefault(); return e.shiftKey ? redo() : undo(); }
   if (mod && e.code === 'KeyY') { e.preventDefault(); return redo(); }
@@ -1552,6 +1901,8 @@ window.addEventListener('keydown', e => {
   if (k === 'KeyM') return setTool('move');
   if (k === 'KeyE') return setTool('erase');
   if (k === 'KeyB') return setTool('draw');
+  if (k === 'KeyL') return setTool('line');
+  if (k === 'KeyP') return setTool('route');
   if (k === 'KeyQ') return setTool('rotate');
   if (k === 'KeyO') return setTool('orbit');
   if (k === 'KeyZ' && e.shiftKey) return frameAll();
@@ -1598,6 +1949,7 @@ const addMenu = () => [
   '-',
   { label: '画像（PNG / JPG）…', action: () => pickFiles('image') },
   { label: '3Dデータ（glb / gltf / obj / fbx / stl）…', action: () => pickFiles('model') },
+  { label: '三面図から3Dモデルを作る…', action: threeViewDialog },
 ];
 const objectMenu = () => [
   { label: '複製', shortcut: 'Shift D', action: duplicateSelected, disabled: !sel() },
@@ -1933,6 +2285,7 @@ function renderProps(el) {
   title.querySelector('button').onclick = () => setSelection([], null);
   el.appendChild(title);
 
+  if (v?.type === 'line' || v?.type === 'route') return renderPolyCard(el, c, id, v);
   const dim = (i, label) => xformField(label, hh => dims(hh).getComponent(i) * 1000,
     (hh, val) => { const base = hh.userData.baseBox.getSize(new V3()).getComponent(i); if (base > 1e-6 && val > 0) hh.scale.setComponent(i, Math.sign(hh.scale.getComponent(i) || 1) * val / 1000 / base); }, { step: 5, min: 1 });
   const loc = (i, label) => xformField(label, hh => hh.position.getComponent(i) * 1000, (hh, val) => hh.position.setComponent(i, val / 1000), { step: 5 });
@@ -1956,6 +2309,13 @@ function renderProps(el) {
     el.appendChild(prow('色', sw));
   }
   if (v?.type === 'model') el.appendChild(prow('単位', fieldFor(unitDef(id))));
+  if (v?.type === 'image') {
+    // floor signs: lay the picture flat on the floor (or stand it up again)
+    const flat = Math.abs((h.rotation.x / DEG) + 90) < 1;
+    const b = document.createElement('button'); b.className = 'btn'; b.textContent = flat ? '立てる' : '床に寝かせる（床サイン）';
+    b.onclick = () => { beginEdit([activeKey]); const hh = holderOf(activeKey); if (flat) { hh.rotation.x = 0; } else { hh.rotation.x = -Math.PI / 2; hh.position.z = floorAt(hh.position.x, hh.position.y, hh.position.z + 0.5) + 0.003; } hh.updateMatrixWorld(true); endEdit(flat ? '画像を立てる' : '画像を床に寝かせる'); };
+    el.appendChild(prow('置き方', b));
+  }
 
   const btns = document.createElement('div'); btns.className = 'btns';
   const mk = (label, fn, cls = '') => { const x = document.createElement('button'); x.className = 'btn ' + cls; x.textContent = label; x.onclick = fn; btns.appendChild(x); };
@@ -1966,6 +2326,42 @@ function renderProps(el) {
   el.appendChild(btns);
 }
 
+function renderPolyCard(el, c, id, v) {
+  const L = polyLength(v.points);
+  const num = (label, key, unit, step, digits, scale = 1, min = 0) => numField({ label, unit, step, digits, min, get: () => (store.objects[id]?.[key] ?? 0) * scale,
+    set: val => commit([{ c, id, v: { ...store.objects[id], [key]: Math.max(min, val) / scale } }], label + 'を変更') });
+  if (v.type === 'line') {
+    el.appendChild(prow('長さ', Object.assign(document.createElement('div'), { className: 'note', textContent: `${fmt(L)} mm` })));
+    el.appendChild(prow('太さ', num('太さ', 'width', 'mm', 5, 0, 1000, 5)));
+  } else {
+    const secs = L / (v.speed || 1);
+    el.appendChild(prow('長さ', Object.assign(document.createElement('div'), { className: 'note', textContent: `${L.toFixed(1)} m　ゆっくり歩いて約${secs >= 60 ? Math.floor(secs / 60) + '分' : ''}${Math.round(secs % 60)}秒` })));
+    el.appendChild(prow('速さ', num('歩く速さ', 'speed', 'm/秒', 0.05, 2, 1, 0.2)));
+    el.appendChild(prow('人数', num('人数', 'people', '人', 0.2, 0, 1, 1)));
+    el.appendChild(prow('間隔', num('間隔', 'interval', '秒', 0.1, 1, 1, 0.3)));
+    el.appendChild(prow('幅', num('通路の幅', 'width', 'mm', 10, 0, 1000, 100)));
+    const play = document.createElement('div'); play.className = 'btns';
+    const running = sim.playing && sim.id === id;
+    play.innerHTML = `<button class="btn primary">${running ? '■ 止める' : '▶ 人を歩かせる'}</button><button class="btn">${sim.follow && running ? '目線をやめる' : '👁 この人の目線で歩く'}</button>`;
+    play.children[0].onclick = () => running ? stopSim() : startSim(id);
+    play.children[1].onclick = () => (sim.follow && running) ? exitFollow() : startSim(id, true);
+    el.appendChild(play);
+  }
+  const sw = document.createElement('div'); sw.className = 'swatches';
+  for (const col of v.type === 'line' ? LINE_COLORS : ['#5b5bd6', '#d6453d', '#2fa36b', '#f2c200', '#3a3936']) {
+    const b = document.createElement('button'); b.className = 'swatch' + ((v.color || '').toLowerCase() === col ? ' on' : ''); b.style.background = col;
+    b.onclick = () => commit([{ c, id, v: { ...store.objects[id], color: col } }], '色を変更'); sw.appendChild(b);
+  }
+  el.appendChild(prow('色', sw));
+  const btns = document.createElement('div'); btns.className = 'btns';
+  for (const [label, fn, cls] of [['複製', duplicateSelected, ''], ['削除', () => { if (sim.id === id) stopSim(); deleteSelected(); }, 'danger']]) { const x = document.createElement('button'); x.className = 'btn ' + cls; x.textContent = label; x.onclick = fn; btns.appendChild(x); }
+  el.appendChild(btns);
+}
+function floorAt(x, y, fromZ) {
+  const rc = new THREE.Raycaster(new V3(x, y, fromZ), new V3(0, 0, -1));
+  const hit = rc.intersectObjects([spaceRoot], true).find(hh => hh.object.isMesh && visibleChain(hh.object) && hitNormal(hh).z > 0.5);
+  return hit ? hit.point.z : 0;
+}
 let lastOpacityBefore = null;
 
 function transformRows(b) {
@@ -2050,10 +2446,12 @@ function setHints() {
     : draw.phase === 1 ? [k('クリック', '対角の点'), k('数値 Enter', '幅,奥行（例 900,450）'), k('Esc', 'やめる')]
     : [k('上下に動かす', '高さ'), k('クリック', '確定'), k('数値 Enter', '高さ（mm）'), k('Esc', 'やめる')];
   else if (tool === 'erase') h = [k('クリック', 'オブジェクト・メジャーを削除')];
+  else if (tool === 'line' || tool === 'route') h = [k('クリック', '点を打つ'), k('ダブルクリック / Enter', '終わる'), k('Shift', '縦横にまっすぐ'), k('Backspace', '1点戻す'), k('Esc', 'やめる')];
   else if (tool === 'orbit' || tool === 'pan' || tool === 'zoom') h = [k('ドラッグ', { orbit: '回転', pan: '平行移動', zoom: 'ズーム' }[tool]), k('Space', '選択に戻る')];
   else if (tool === 'measure') h = [k('ドラッグ', '2点間を測る'), k('Ctrl', '吸着の切り替え'), k('Shift', '軸にそろえる'), k('端をドラッグ', '編集'), k('X / Delete', '削除')];
   else if (tool === 'rotate') h = [k('物をクリック', '選ぶ'), k('輪をドラッグ', '回す'), k('Ctrl', '5°刻みの切り替え')];
   else h = [k('物をドラッグ', '移動'), k('何もない所をドラッグ', planMode ? '平行移動' : '視点を回す'), k('Shift+ドラッグ', '範囲選択'), k('ホイール', 'ズーム'), k('Delete', '削除')];
+  if (sim.follow) h = [k('ドラッグ', '見回す'), k('Esc', '目線をやめる')];
   $('hints').innerHTML = h.join('');
 }
 function updateStatusCoords(e) { /* cursor readout lives in the status bar's right side */ }

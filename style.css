@@ -217,3 +217,17 @@ body.local #peers { display: none; }
   .tool .t, .tool .k, #hints, #topbar > .chip, #topbar > .chip-pair { display: none; }
   .card { left: 10px; right: 10px; width: auto; top: auto; bottom: 76px; max-height: 45%; }
 }
+
+/* three-view → 3D dialog */
+.tv-dialog { width: min(620px, calc(100vw - 32px)); }
+.tv-sheet { border: 2px dashed var(--line); border-radius: 12px; padding: 18px; text-align: center; color: var(--muted); cursor: pointer; margin: 10px 0; }
+.tv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.tv-slot { height: 120px; border: 2px dashed var(--line); border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: var(--muted); cursor: pointer; background: center / contain no-repeat; background-color: var(--surface-2); }
+.tv-slot.on b, .tv-slot.on span { background: var(--glass); padding: 0 6px; border-radius: 6px; }
+.tv-slot.on span { display: none; }
+.tv-slot.on { border-style: solid; border-color: var(--accent); }
+.tv-sheet.drag, .tv-slot.drag { border-color: var(--accent); background-color: var(--accent-soft); }
+.tv-dims { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0 6px; }
+.tv-dims label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
+.tv-dims .tf, .tv-dims .sf { height: 32px; }
+#toolbar { max-width: calc(100% - 24px); overflow-x: auto; }
