@@ -155,11 +155,14 @@ function redo() {
 let editing = null;   // {keys, before}
 function beginEdit(keys) {
   if (editing) return;
-  editing = { keys: [...keys], before: keys.map(k => { const [c, id] = splitKey(k); return { c, id, v: clone(store[c][id] ?? null) }; }) };
+  // things standing on top of what is edited (an iMac on a pedestal) are carried along
+  const riders = ridersOf(keys); keys = [...keys, ...riders.map(r => r.key)];
+  editing = { keys, riders, floatKeys: new Set(), mount: null, before: keys.map(k => { const [c, id] = splitKey(k); return { c, id, v: clone(store[c][id] ?? null) }; }) };
 }
 function editOps() { return editing.keys.map(k => entityOpFromHolder(k)).filter(Boolean); }
 function liveEdit() {
   if (!editing) return;
+  carryRiders();
   const ops = editOps(); ops.forEach(o => setLocal(o, true)); send(ops, false); requestRender(); refreshPanels(true);
 }
 function endEdit(label, cancel = false) {
@@ -167,7 +170,14 @@ function endEdit(label, cancel = false) {
   const ed = editing; editing = null;
   if (cancel) { ed.before.forEach(o => setLocal(o)); send(ed.before); }
   else {
-    ed.keys.forEach(k => { const o = entityOpFromHolder(k); if (o) { ed.after = ed.after || []; ed.after.push(o); setLocal(o, true); } });
+    carryRiders(ed); groundEdited(ed);
+    const riderKeys = new Set(ed.riders.map(r => r.key));
+    ed.after = [];
+    for (const k of ed.keys) {
+      const o = entityOpFromHolder(k); if (!o) continue;
+      if (o.c === 'objects' && !riderKeys.has(k)) { if (ed.floatKeys.has(k)) o.v.mount = 'float'; else if (ed.mount) o.v.mount = ed.mount; }
+      ed.after.push(o); setLocal(o, true);
+    }
     if (ed.after?.length) { send(ed.after); pushUndo(label, ed.before, ed.after); ed.after.forEach(o => syncEntity(o.c, o.id)); }
   }
   refreshPanels();
@@ -196,6 +206,7 @@ const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 9000);
 let camera = persp;
 
 const clipPlane = new THREE.Plane(new V3(0, 0, -1), 3);
+const CEIL_CUT = 2.5; let ceilMode = false;   // ceiling view: keep only what is above this height
 const spaceRoot = new THREE.Group(); spaceRoot.name = 'space'; scene.add(spaceRoot);
 const userRoot = new THREE.Group(); userRoot.name = 'user'; scene.add(userRoot);
 const rulerRoot = new THREE.Group(); scene.add(rulerRoot);
@@ -315,7 +326,10 @@ function updateViewInfo() {
 // Clipping / x-ray
 // =====================================================================
 const spaceMaterials = new Set();
-function applyClip() { clipPlane.constant = planMode ? 1.5 : prefs.clip ? prefs.clipH / 1000 : 1e6; $('clipBtn').classList.toggle('on', prefs.clip); requestRender(); }
+function applyClip() {
+  // the ceiling view keeps only what is above CEIL_CUT (wiring, ducts, lights); every other view cuts away the top
+  if (ceilMode) clipPlane.set(new V3(0, 0, 1), -CEIL_CUT);
+  else clipPlane.set(new V3(0, 0, -1), planMode ? 1.5 : prefs.clip ? prefs.clipH / 1000 : 1e6); $('clipBtn').classList.toggle('on', prefs.clip); requestRender(); }
 function applyXray() {
   for (const m of spaceMaterials) {
     m.transparent = prefs.xray || m.userData.origTransparent; m.opacity = prefs.xray ? 0.3 : m.userData.origOpacity;
@@ -374,6 +388,7 @@ loadSpaceBuffer().then(buf => gltfLoader.parseAsync(buf, '')).then(gltf => {
   }
   applyXray();
   for (const key of spaceHolders.keys()) syncSpace(key);
+  redrapeAll();
   $('loading').remove(); frameAll(); refreshPanels(); requestRender();
 }).catch(err => { $('loading').textContent = '展示空間を読み込めませんでした：' + err.message; });
 
@@ -419,7 +434,7 @@ function syncAll() {
   for (const id of Object.keys(store.rulers)) syncRuler(id);
   scheduleUI(); requestRender();
 }
-const shapeKey = v => [v.type, v.asset?.id, v.unit, v.yup, v.type === 'line' || v.type === 'route' ? JSON.stringify([v.points, v.width]) : ''].join('|');
+const shapeKey = v => [v.type, v.kit, v.asset?.id, v.unit, v.yup, v.type === 'line' || v.type === 'route' ? JSON.stringify([v.points, v.width]) : ''].join('|');
 function disposeHolder(h) {
   h.traverse(o => { if (o.isCSS2DObject) o.element.remove(); if (o.isMesh && o.userData.own) { o.geometry.dispose?.(); } });
   h.removeFromParent();
@@ -438,6 +453,7 @@ function syncObject(id) {
     h.position.fromArray(v.loc); h.rotation.set(...v.rot); h.scale.fromArray(v.scale);
   }
   h.visible = !v.hidden;
+  if (isPoly(v)) drapePoly(h, v);
   h.traverse(o => {
     if (o.userData.tintColorOnly) { o.material.color.set(v.color || '#ffffff'); return; }
     if (!o.isMesh || !o.userData.tint) return;
@@ -460,6 +476,8 @@ function buildShape(h, v) {
     loadAsset(v.asset).then(t => { mat.map = t.texture; mat.needsUpdate = true; requestRender(); }).catch(() => { mat.color.set(0xff00ff); });
   } else if (v.type === 'line' || v.type === 'route') {
     buildPolyShape(h, v);
+  } else if (v.type === 'kit') {
+    buildKit(h, v.kit);
   } else if (v.type === 'model') {
     const ph = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: 0x888888, wireframe: true })); h.add(ph);
     loadAsset(v.asset).then(tpl => {
@@ -490,6 +508,188 @@ function updateLabel(h) {
   else if (v.type === 'route') { const L = polyLength(v.points); lbl.element.textContent = `${v.name}  ${(L).toFixed(1)} m・約${Math.max(1, Math.round(L / (v.speed || 1)))}秒`; }
   else lbl.element.textContent = v.type === 'image' ? `${v.name}  ${fmt(d.x)}×${fmt(d.z)}` : `${v.name}  ${fmt(d.x)}×${fmt(d.y)}×${fmt(d.z)}`;
   lbl.element.classList.toggle('sel', selected.has('objects:' + h.userData.id));
+}
+
+// ---------- resting on floors and tops, hanging on walls ----------
+// mount: 'floor' = stands on the floor or on top of whatever is under it, 'wall' = hangs on a wall, 'float' = stays where it is put
+const isPoly = v => v?.type === 'line' || v?.type === 'route';
+function mountOf(v) {
+  if (!v) return 'float';
+  if (v.mount) return v.mount;
+  return v.type === 'image' && Math.abs(v.rot?.[0] || 0) < 0.01 ? 'wall' : 'floor';   // older pictures: upright ones were hung
+}
+const REACH = 2.0;   // how far above its own bottom a resting object looks for something to stand on
+const downRay = new THREE.Raycaster();
+function worldBox(h) { h.updateMatrixWorld(true); return h.userData.baseBox.clone().applyMatrix4(h.matrixWorld); }
+// height of the first level surface below (x, y, fromZ); lines and pictures never carry anything
+function supportZ(x, y, fromZ, skip, spaceOnly = false) {
+  downRay.set(new V3(x, y, fromZ), new V3(0, 0, -1));
+  for (const hit of downRay.intersectObjects(spaceOnly ? [spaceRoot] : [userRoot, spaceRoot], true)) {
+    if (!hit.object.isMesh) continue;
+    const h = holderFromObject(hit.object); if (!h || !visibleChain(h)) continue;   // the holder, not the mesh: floors are hidden in the plan view but still count
+    if (h.userData.c === 'objects') { const t = store.objects[h.userData.id]?.type; if (isPoly({ type: t }) || t === 'image') continue; }
+    if (skip?.(h) || Math.abs(hitNormal(hit).z) < 0.5) continue;   // any level face: some floor faces are wound downward
+    return hit.point.z;
+  }
+  return null;
+}
+// drop or lift a resting object onto whatever is under its centre
+function settle(h) {
+  const v = store.objects[h.userData.id];
+  if (isPoly(v)) {
+    const z = supportZ(h.position.x, h.position.y, h.position.z + 0.3, null, v.type === 'route') ?? supportZ(h.position.x, h.position.y, h.position.z + REACH, null, true);
+    if (z != null) h.position.z = z;
+  } else {
+    const b = worldBox(h), c = b.getCenter(new V3());
+    // never climb onto what is standing on this piece itself
+    const z = supportZ(c.x, c.y, b.min.z + REACH, o => o === h || (o.userData.c === 'objects' && Math.abs(worldBox(o).min.z - b.max.z) < 0.02));
+    if (z != null) h.position.z += z - b.min.z + (v?.type === 'image' ? 0.003 : 0);
+  }
+  h.updateMatrixWorld(true);
+}
+const unscaled = h => new THREE.Matrix4().compose(h.position, h.quaternion, new V3(1, 1, 1));
+function ridersOf(keys) {
+  const moving = new Set(keys), out = [];
+  const queue = keys.map(holderOf).filter(h => h?.userData.c === 'objects');
+  while (queue.length) {
+    const sup = queue.shift(), sv = store.objects[sup.userData.id];
+    if (!sv || isPoly(sv) || sv.type === 'image') continue;
+    const sb = worldBox(sup);
+    for (const [id, h] of userHolders) {
+      const k = 'objects:' + id;
+      if (moving.has(k) || !h.visible || mountOf(store.objects[id]) !== 'floor') continue;
+      const b = worldBox(h), c = b.getCenter(new V3());
+      if (Math.abs(b.min.z - sb.max.z) > 0.02 || c.x < sb.min.x || c.x > sb.max.x || c.y < sb.min.y || c.y > sb.max.y) continue;
+      moving.add(k); out.push({ key: k, h, sup, rel: unscaled(sup).invert().multiply(unscaled(h)) }); queue.push(h);
+    }
+  }
+  return out;
+}
+function carryRiders(ed = editing) {
+  const s = new V3();
+  for (const r of ed?.riders || []) { unscaled(r.sup).multiply(r.rel).decompose(r.h.position, r.h.quaternion, s); r.h.updateMatrixWorld(true); }
+}
+function groundEdited(ed) {
+  const riderKeys = new Set(ed.riders.map(r => r.key)), hs = [];
+  for (const k of ed.keys) {
+    const [c, id] = splitKey(k), h = holderOf(k); if (c !== 'objects' || !h) continue;
+    const m = ed.floatKeys.has(k) ? 'float' : ed.mount && !riderKeys.has(k) ? ed.mount : mountOf(store.objects[id]);
+    if (m === 'floor') hs.push(h);
+  }
+  hs.sort((a, b) => worldBox(a).min.z - worldBox(b).min.z).forEach(settle);
+}
+// hang h on a wall: back against the wall at point p (normal n pointing into the room), centre at height centerZ
+function hangAt(h, p, n, centerZ, xoff = 0) {
+  const nh = new V3(n.x, n.y, 0).normalize(), ang = Math.atan2(nh.x, -nh.y);   // the front of every object is its -Y side
+  h.rotation.set(0, 0, ang);
+  const bb = h.userData.baseBox, s = h.scale;
+  const back = bb.max.y * Math.abs(s.y) + 0.002, midZ = (bb.min.z + bb.max.z) / 2 * Math.abs(s.z), midX = (bb.min.x + bb.max.x) / 2 * Math.abs(s.x);
+  const right = new V3(Math.cos(ang), Math.sin(ang), 0);
+  h.position.set(p.x + nh.x * back, p.y + nh.y * back, centerZ - midZ).addScaledVector(right, -(xoff + midX));
+  h.updateMatrixWorld(true);
+}
+const wallRay = new THREE.Raycaster();
+// the closest wall (or wall-like box) around h, preferring the one behind it
+function nearestWall(h, maxDist = 3) {
+  const b = worldBox(h), c = b.getCenter(new V3());
+  const floor = supportZ(c.x, c.y, b.min.z + 0.05, null, true) ?? b.min.z;
+  const cz = b.min.z - floor > 0.3 ? c.z : floor + 1.5;
+  const back = new V3(0, 1, 0).applyQuaternion(h.quaternion).setZ(0);
+  const dirs = [...(back.lengthSq() > 1e-6 ? [back.normalize()] : []), ...Array.from({ length: 16 }, (_, i) => new V3(Math.cos(i * Math.PI / 8), Math.sin(i * Math.PI / 8), 0))];
+  let best = null;
+  dirs.forEach((dir, i) => {
+    wallRay.set(new V3(c.x, c.y, cz), dir); wallRay.far = maxDist;
+    for (const hit of wallRay.intersectObjects([userRoot, spaceRoot], true)) {
+      if (!hit.object.isMesh) continue;
+      const o = holderFromObject(hit.object); if (!o || o === h || !visibleChain(o)) continue;
+      if (o.userData.c === 'objects') { const t = store.objects[o.userData.id]?.type; if (isPoly({ type: t }) || t === 'image') continue; }
+      const n = hitNormal(hit); if (Math.abs(n.z) > 0.3) continue;
+      if (n.dot(dir) > 0) n.negate();
+      const score = hit.distance * (i === 0 && back.lengthSq() > 1e-6 ? 0.7 : 1);
+      if (!best || score < best.score) best = { p: hit.point.clone(), n, cz, score };
+      break;
+    }
+  });
+  return best;
+}
+function heightAboveFloor(h) {
+  const b = worldBox(h), c = b.getCenter(new V3()), fwd = new V3(0, -0.3, 0).applyQuaternion(h.quaternion).setZ(0);
+  const floor = supportZ(c.x + fwd.x, c.y + fwd.y, c.z, null, true) ?? 0;
+  return c.z - floor;
+}
+
+// ---------- ready-made pieces: pedestals, sawhorse tables, iMac ----------
+const kitEdgeMat = new THREE.LineBasicMaterial({ color: 0x1a1a1a, transparent: true, opacity: 0.55 });
+const kitMats = new Map();
+function kitMat(color, o = {}) {
+  const key = color + JSON.stringify(o);
+  if (!kitMats.has(key)) kitMats.set(key, new THREE.MeshStandardMaterial({ color, roughness: 0.7, ...o }));
+  return kitMats.get(key);
+}
+function kitPart(g, [w, d, hh], [x, y, z], mat, { rx = 0, ry = 0, edges = true } = {}) {
+  const geo = new THREE.BoxGeometry(w, d, hh), m = new THREE.Mesh(geo, mat);
+  m.position.set(x, y, z); m.rotation.set(rx, ry, 0); m.userData.own = true;
+  if (edges) { const e = new THREE.LineSegments(new THREE.EdgesGeometry(geo), kitEdgeMat); e.raycast = () => {}; m.add(e); }
+  g.add(m); return m;
+}
+// a folding sawhorse: beam on top, four splayed legs, a stretcher on each side (beam runs along Y)
+function trestle(g, cx, D = 0.6, H = 0.875) {
+  const wood = kitMat('#c9a77c', { roughness: 0.8 });
+  kitPart(g, [0.09, D, 0.04], [cx, 0, H - 0.02], wood);
+  const spread = 0.19, legH = H - 0.04, L = Math.hypot(spread, legH), a = Math.atan2(spread, legH);
+  for (const sx of [-1, 1]) {
+    // raised by the tilt so the outer foot corner stands exactly on the floor
+    for (const sy of [-1, 1]) kitPart(g, [0.038, 0.063, L], [cx + sx * (0.03 + spread / 2), sy * (D / 2 - 0.05), legH / 2 + 0.019 * Math.sin(a)], wood, { ry: -sx * a });
+    kitPart(g, [0.022, D - 0.037, 0.07], [cx + sx * (0.03 + spread * (1 - 0.3 / legH) + 0.03), 0, 0.3], wood);
+  }
+}
+const KITS = {
+  saw1800: g => { kitPart(g, [1.8, 0.6, 0.025], [0, 0, 0.8875], kitMat('#dcc59a', { roughness: 0.75 })); trestle(g, -0.65); trestle(g, 0.65); },
+  saw1200: g => { kitPart(g, [1.2, 0.6, 0.025], [0, 0, 0.8875], kitMat('#dcc59a', { roughness: 0.75 })); trestle(g, -0.35); trestle(g, 0.35); },
+  sawLeg: g => trestle(g, 0),
+  // iMac 21.5-inch (4K, 2019): 528 wide, 450 high, stand depth 175; the screen faces -Y
+  imac215: g => {
+    const alu = kitMat('#c9cacd', { metalness: 0.6, roughness: 0.35 });
+    kitPart(g, [0.19, 0.175, 0.006], [0, 0.0275, 0.003], alu);
+    kitPart(g, [0.17, 0.006, 0.233], [0, 0.054, 0.113], alu, { rx: Math.atan2(0.092, 0.214) });
+    kitPart(g, [0.528, 0.012, 0.362], [0, -0.034, 0.269], alu);
+    kitPart(g, [0.40, 0.035, 0.26], [0, -0.01, 0.25], alu, { edges: false });
+    kitPart(g, [0.524, 0.002, 0.293], [0, -0.041, 0.3015], kitMat('#0c0c0d', { roughness: 0.15 }), { edges: false });
+    kitPart(g, [0.476, 0.002, 0.268], [0, -0.0415, 0.3045], kitMat('#26364a', { roughness: 0.2, emissive: 0x0d1520 }), { edges: false });
+  },
+};
+function buildKit(h, kind) {
+  const g = new THREE.Group(); (KITS[kind] || KITS.sawLeg)(g);
+  g.updateMatrixWorld(true);
+  h.userData.baseBox = new THREE.Box3().setFromObject(g, true);
+  h.add(g);
+}
+// [menu label, size note, entity fields]
+const SAMPLES = [
+  ['白展示台', 'W600 D600 H900', { type: 'box', scale: [0.6, 0.6, 0.9], color: '#f4f3ef' }],
+  ['黒展示台', 'W900 D900 H900', { type: 'box', scale: [0.9, 0.9, 0.9], color: '#262626' }],
+  ['ソーホース・大', 'W1800 D600 H900', { type: 'kit', kit: 'saw1800', color: null }],
+  ['ソーホース・小', 'W1200 D600 H900', { type: 'kit', kit: 'saw1200', color: null }],
+  ['ソーホース・足', 'D600 H875', { type: 'kit', kit: 'sawLeg', color: null }],
+  ['iMac 21.5インチ（4K, 2019）', 'W528 D175 H450', { type: 'kit', kit: 'imac215', color: null }],
+  ['ポスター A1', '594 × 841', { type: 'box', scale: [0.594, 0.005, 0.841], color: '#ffffff', mount: 'wall' }],
+  ['ポスター B1', '728 × 1030', { type: 'box', scale: [0.728, 0.005, 1.03], color: '#ffffff', mount: 'wall' }],
+];
+function addSample([name, , fields]) {
+  const id = rid(), k = 'objects:' + id;
+  commit([{ c: 'objects', id, v: newEntity({ name: nextName(name.replace(/（.*）/, '')), mount: 'floor', ...fields }) }], name + 'を追加');
+  // posters go onto the nearest wall; with no wall nearby they stand on the floor until dragged onto one
+  const h = userHolders.get(id), w = fields.mount === 'wall' && nearestWall(h);
+  if (w) hangAt(h, w.p, w.n, w.cz); else settle(h);
+  amendLast(k);
+  setSelection([k], k);
+  toast(fields.mount === 'wall' ? 'ドラッグして壁の上に持っていくと壁に貼りつきます' : 'ドラッグで移動。台の上に持っていくと天面に乗ります', 2600);
+}
+// fold a follow-up placement of a just-created object into that creation's undo step
+function amendLast(k) {
+  const o = entityOpFromHolder(k); if (!o) return;
+  setLocal(o); send([o]);
+  const u = undoStack[undoStack.length - 1]; if (u) u.after = u.after.map(a => a.c === o.c && a.id === o.id ? clone(o) : a);
 }
 
 // ---------- assets ----------
@@ -639,13 +839,13 @@ function raycastAll(e, { selectable = false, exclude = null } = {}) {
   raycaster.setFromCamera(mouseNDC(e), camera);
   const roots = [userRoot, spaceRoot];
   const hits = raycaster.intersectObjects(roots, true);
-  const clipZ = clipPlane.constant;
+
   for (const hit of hits) {
     if (!hit.object.isMesh || !visibleChain(hit.object)) continue;
     const h = holderFromObject(hit.object); if (!h) continue;
     if (exclude && exclude.has(h)) continue;
     if (h.userData.c === 'space') {
-      if (hit.point.z > clipZ + 1e-4) continue;
+      if (clipPlane.distanceToPoint(hit.point) < -1e-4) continue;   // cut away by the section
       if (selectable && !prefs.spaceSelectable) return null;
     }
     hit.holder = h; return hit;
@@ -737,7 +937,8 @@ function nextName(base) {
   for (let i = 1; ; i++) { const n = `${base}.${String(i).padStart(3, '0')}`; if (!names.has(n)) return n; }
 }
 function newEntity(fields) {
-  return { name: 'オブジェクト', loc: cursor.pos.toArray(), rot: [0, 0, 0], scale: [1, 1, 1], color: '#ffffff', opacity: 1, hidden: false,
+  const rest = supportZ(cursor.pos.x, cursor.pos.y, cursor.pos.z + 0.5) ?? cursor.pos.z;   // stand on whatever is at the cursor
+  return { name: 'オブジェクト', loc: [cursor.pos.x, cursor.pos.y, rest], rot: [0, 0, 0], scale: [1, 1, 1], color: '#ffffff', opacity: 1, hidden: false,
     by: prefs.name || 'ゲスト', created: Date.now(), ...fields };
 }
 
@@ -764,11 +965,11 @@ function placementForCursor(heightM) {
   const n = cursor.normal;
   if (Math.abs(n.z) < 0.5) {
     const h = new V3(n.x, n.y, 0).normalize();
-    return { loc: cursor.pos.clone().addScaledVector(h, 0.003).add(new V3(0, 0, -heightM / 2)).toArray(), rot: [0, 0, Math.atan2(h.x, -h.y)] };
+    return { loc: cursor.pos.clone().addScaledVector(h, 0.003).add(new V3(0, 0, -heightM / 2)).toArray(), rot: [0, 0, Math.atan2(h.x, -h.y)], mount: 'wall' };
   }
   const toCam = new V3().subVectors(camera.position, cursor.pos); toCam.z = 0;
   const ang = toCam.lengthSq() > 1e-6 ? Math.atan2(toCam.x, -toCam.y) : 0;
-  return { loc: cursor.pos.toArray(), rot: [0, 0, ang] };
+  return { loc: [cursor.pos.x, cursor.pos.y, supportZ(cursor.pos.x, cursor.pos.y, cursor.pos.z + 0.5) ?? cursor.pos.z], rot: [0, 0, ang], mount: 'wall' };
 }
 async function importFiles(files) {
   for (const file of files) {
@@ -787,6 +988,7 @@ async function importFiles(files) {
         const widthM = 1, heightM = widthM * parsed.h / parsed.w;
         const pl = placementForCursor(heightM);
         commit([{ c: 'objects', id, v: newEntity({ type: 'image', name: nextName(base), asset, ...pl, scale: [widthM, widthM, widthM] }) }], '画像を読み込み');
+        if (Math.abs(cursor.normal.z) >= 0.5) { const h = userHolders.get(id), w = nearestWall(h); if (w) { hangAt(h, w.p, w.n, w.cz); amendLast('objects:' + id); } }
         setSelection(['objects:' + id], 'objects:' + id);
         showLastOp('画像を読み込み', [
           numDef('幅', () => store.objects[id]?.scale[0] * 1000, val => { const v = store.objects[id]; if (v && val > 0) commit([{ c: 'objects', id, v: { ...v, scale: [val / 1000, val / 1000, val / 1000] } }], '画像の大きさ'); }),
@@ -824,6 +1026,14 @@ function deleteSelected() {
     if (c === 'objects') ops.push({ c, id, v: null });
     else if (c === 'space') ops.push({ c, id, v: { ...(store.space[id] || {}), deleted: true } });
   }
+  // whatever stood on a deleted piece comes down onto what is below
+  const riders = ridersOf(keys.filter(k => k.startsWith('objects:')));
+  if (riders.length) {
+    const hiddenNow = keys.map(holderOf).filter(h => h?.visible); hiddenNow.forEach(h => h.visible = false);
+    riders.map(r => r.h).sort((a, b) => worldBox(a).min.z - worldBox(b).min.z).forEach(settle);
+    hiddenNow.forEach(h => h.visible = true);
+    for (const r of riders) { const o = entityOpFromHolder(r.key); if (o) ops.push(o); }
+  }
   if (selRuler) ops.push({ c: 'rulers', id: selRuler, v: null });
   setSelection([], null); selRuler = null;
   if (ops.length) commit(ops, '削除');
@@ -844,19 +1054,17 @@ function selectAll() {
   if (prefs.spaceSelectable) for (const [id, h] of spaceHolders) if (h.visible) keys.push('space:' + id);
   setSelection(keys);
 }
-function dropToFloor() {
-  const keys = editableKeys(); if (!keys.length) return;
-  beginEdit(keys);
-  const down = new THREE.Raycaster();
-  for (const k of keys) {
-    const h = holderOf(k), b = new THREE.Box3().setFromObject(h, true), c = b.getCenter(new V3());
-    const own = new Set([h]);
-    down.set(new V3(c.x, c.y, b.min.z + 0.001), new V3(0, 0, -1));
-    const hit = down.intersectObjects([userRoot, spaceRoot], true).find(x => x.object.isMesh && visibleChain(x.object) && !own.has(holderFromObject(x.object)));
-    const floor = hit ? hit.point.z : 0;
-    h.position.z += floor - b.min.z; h.updateMatrixWorld(true);
+function dropToFloor() { setMount('floor'); }
+function setMount(mount) {
+  const keys = editableKeys().filter(k => k.startsWith('objects:')); if (!keys.length) return;
+  beginEdit(keys); editing.mount = mount;
+  if (mount === 'wall') {
+    let hung = 0;
+    for (const k of keys) { if (isPoly(store.objects[splitKey(k)[1]])) continue; const h = holderOf(k), w = nearestWall(h); if (w) { hangAt(h, w.p, w.n, w.cz); hung++; } }
+    if (!hung) { endEdit('', true); toast('3 m以内に壁が見つかりません。壁の近くへ動かしてから押してください', 3200); return; }
+    toast('壁に掛けました。ドラッグすると壁に沿って動きます', 2500);
   }
-  endEdit('床に下ろす');
+  endEdit({ floor: '床・台に置く', wall: '壁に掛ける', float: '浮かせる' }[mount]);
 }
 function cursorToSelected() { const b = new THREE.Box3(); for (const k of selected) b.expandByPoint(holderOf(k).position); if (!b.isEmpty()) setCursor(b.getCenter(new V3())); }
 function selectedToCursor() {
@@ -977,6 +1185,8 @@ function rayPlane(pt, plane) {
 function finishModal(cancel) {
   if (!modal) return;
   const label = { G: '移動', R: '回転', S: 'スケール' }[modal.type];
+  // moving straight up or down (G then Z) is a deliberate height: the piece floats from then on
+  if (!cancel && editing && modal.type === 'G' && modal.axis === 'z' && !modal.plane) modal.keys.forEach(k => editing.floatKeys.add(k));
   modal = null; guideLine.visible = false;
   endEdit(label, cancel);
   $('modalText').classList.add('hidden');
@@ -1003,6 +1213,7 @@ tc.addEventListener('change', requestRender);
 tc.addEventListener('dragging-changed', e => {
   if (e.value) {
     const keys = editableKeys(); beginEdit(keys);
+    if (tc.getMode() === 'translate' && tc.axis && tc.axis !== 'XYZ' && tc.axis.includes('Z')) keys.forEach(k => editing.floatKeys.add(k));   // lifted on purpose
     const act = tc.object; act.updateMatrixWorld(true);
     gizmoStart = { inv: act.matrixWorld.clone().invert(), others: keys.map(holderOf).filter(h => h !== act).map(h => ({ h, m: h.matrixWorld.clone() })) };
   } else { gizmoStart = null; endEdit({ translate: '移動', rotate: '回転', scale: 'スケール' }[tc.getMode()]); }
@@ -1094,8 +1305,8 @@ planFill.onBeforeCompile = sh => { sh.fragmentShader = sh.fragmentShader.replace
 const planFloor = new THREE.MeshBasicMaterial({ color: 0xefede7, clippingPlanes: [clipPlane], polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 });
 function setPlanMode(on) {
   if (on === planMode) return;
-  planMode = on; document.body.classList.toggle('plan', on);
-  document.querySelectorAll('#viewSeg button').forEach(b => b.classList.toggle('on', (b.dataset.view === 'plan') === on));
+  if (on && ceilMode) setCeilMode(false);
+  planMode = on; document.body.classList.toggle('plan', on); syncViewSeg();
   for (const m of spaceMeshes) {
     // floors would hide the wall bottoms seen from above, so the plan is drawn on plain paper instead
     const floor = holderFromObject(m)?.userData.role === 'floor';
@@ -1115,7 +1326,25 @@ function setPlanMode(on) {
   }
   applyClip(); applyLook(); updateCamera(); setHints();
 }
-document.querySelectorAll('#viewSeg button').forEach(b => b.onclick = () => setPlanMode(b.dataset.view === 'plan'));
+
+// ceiling view: everything below CEIL_CUT is cut away and you look up from underneath at the wiring and ducts
+let navCeil = null;
+function setCeilMode(on) {
+  if (on === ceilMode) return;
+  if (on && planMode) setPlanMode(false);
+  ceilMode = on; document.body.classList.toggle('ceil', on);
+  if (on) {
+    navCeil = navSnapshot();
+    nav.target.z = 3.6; nav.pitch = -50 * DEG; nav.ortho = false; nav.autoOrtho = false; nav.preset = null; nav.dist = Math.min(nav.dist, 45);
+    toast('天井を下から見ています（2.5 mより下は隠しています）。ドラッグで見回せます', 3500);
+  } else if (navCeil) {
+    nav.target.fromArray(navCeil.target); Object.assign(nav, { dist: navCeil.dist, yaw: navCeil.yaw, pitch: navCeil.pitch, ortho: navCeil.ortho, preset: navCeil.preset }); persp.fov = navCeil.fov;
+  }
+  syncViewSeg(); applyClip(); updateCamera(); setHints();
+}
+function syncViewSeg() { const v = ceilMode ? 'ceil' : planMode ? 'plan' : '3d'; document.querySelectorAll('#viewSeg button').forEach(b => b.classList.toggle('on', b.dataset.view === v)); }
+function setView(v) { if (v === 'ceil') setCeilMode(true); else { setCeilMode(false); setPlanMode(v === 'plan'); } }
+document.querySelectorAll('#viewSeg button').forEach(b => b.onclick = () => setView(b.dataset.view));
 
 // =====================================================================
 // Measurements box (bottom right, like a value control box)
@@ -1271,24 +1500,38 @@ function renderSceneTabs() {
 // =====================================================================
 const LINE_COLORS = ['#f2c200', '#ffffff', '#3a3936', '#d6453d', '#3e7bfa', '#2fa36b'];
 function polyLength(pts) { let L = 0; for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); return L; }
-function ribbonGeometry(points, w, z = 0.003) {
+// zAt(x, y) gives the surface height under a point, so the tape follows floor steps and table tops
+function ribbonGeometry(points, w, zAt = () => 0, lift = 0.003) {
   const pos = [], idx = [];
   for (let i = 0; i < points.length - 1; i++) {
     const [ax, ay] = points[i], [bx, by] = points[i + 1];
     const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy); if (L < 1e-6) continue;
-    const nx = -dy / L * w / 2, ny = dx / L * w / 2, ex = dx / L * w / 2, ey = dy / L * w / 2;   // extended by w/2 so corners close
-    const k = pos.length / 3;
-    pos.push(ax - ex + nx, ay - ey + ny, z, bx + ex + nx, by + ey + ny, z, bx + ex - nx, by + ey - ny, z, ax - ex - nx, ay - ey - ny, z);
-    idx.push(k, k + 3, k + 2, k, k + 2, k + 1);
+    const ux = dx / L, uy = dy / L, nx = -uy * w / 2, ny = ux * w / 2;
+    const n = Math.max(1, Math.ceil((L + w) / DRAPE_STEP)), k0 = pos.length / 3;
+    for (let j = 0; j <= n; j++) {
+      const t = -w / 2 + (L + w) * j / n, tc = Math.min(L, Math.max(0, t));   // extended by w/2 at both ends so corners close
+      const x = ax + ux * t, y = ay + uy * t, z = zAt(ax + ux * tc, ay + uy * tc) + lift;
+      pos.push(x + nx, y + ny, z, x - nx, y - ny, z);
+      if (j) { const a = k0 + (j - 1) * 2; idx.push(a, a + 1, a + 3, a, a + 3, a + 2); }
+    }
   }
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals();
   return g;
 }
-function arrowGeometry(points, step = 1.6, z = 0.005) {
+const DRAPE_STEP = 0.1;
+function densify(points) {
+  const out = [points[0]];
+  for (let i = 1; i < points.length; i++) {
+    const [ax, ay] = points[i - 1], [bx, by] = points[i], n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / DRAPE_STEP));
+    for (let j = 1; j <= n; j++) out.push([ax + (bx - ax) * j / n, ay + (by - ay) * j / n]);
+  }
+  return out;
+}
+function arrowGeometry(points, step = 1.6, zAt = () => 0, lift = 0.005) {
   const pos = [], L = polyLength(points);
   for (let d = step / 2; d < L; d += step) {
     const { p, dir } = pointAlong(points, d);
-    const n = [-dir[1], dir[0]];
+    const n = [-dir[1], dir[0]], z = zAt(p[0], p[1]) + lift;
     pos.push(p[0] + dir[0] * 0.28, p[1] + dir[1] * 0.28, z, p[0] - dir[0] * 0.14 + n[0] * 0.2, p[1] - dir[1] * 0.14 + n[1] * 0.2, z, p[0] - dir[0] * 0.14 - n[0] * 0.2, p[1] - dir[1] * 0.14 - n[1] * 0.2, z);
   }
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.computeVertexNormals();
@@ -1355,18 +1598,38 @@ function polyKey(e) {
   return false;
 }
 function buildPolyShape(h, v) {
-  const ribbon = new THREE.Mesh(ribbonGeometry(v.points, v.width ?? 0.05), new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, transparent: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  const ribbon = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, transparent: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
   ribbon.userData.own = true; ribbon.userData.tint = true; h.add(ribbon);
   // a hairline on top keeps thin tape lines visible when zoomed out
-  const hair = new THREE.Line(new THREE.BufferGeometry().setFromPoints(v.points.map(([x, y]) => new V3(x, y, 0.006))), new THREE.LineBasicMaterial());
+  const hair = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial());
   hair.userData.tintColorOnly = true; hair.raycast = () => {}; h.add(hair);
+  let arrows = null;
   if (v.type === 'route') {
-    const arrows = new THREE.Mesh(arrowGeometry(v.points), new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
+    arrows = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({ side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
     arrows.userData.own = true; arrows.userData.tintColorOnly = true; h.add(arrows);
   }
+  h.userData.poly = { ribbon, hair, arrows };
   const b = new THREE.Box3(); for (const [x, y] of v.points) b.expandByPoint(new V3(x, y, 0)); b.expandByScalar((v.width ?? 0.05) / 2); b.max.z = 0.01; b.min.z = 0;
   h.userData.baseBox = b;
 }
+// lay a line / route onto the floor (and, for tape lines, onto table tops) under it; floating ones stay flat
+let drapeEpoch = 0;
+function drapePoly(h, v) {
+  const P = h.userData.poly; if (!P) return;
+  const key = JSON.stringify([v.loc, v.rot, mountOf(v), drapeEpoch]);
+  if (P.key === key) return; P.key = key;
+  h.updateMatrixWorld(true);
+  const base = h.position.z, w = new V3();
+  const zAt = mountOf(v) !== 'floor' ? () => 0 : (x, y) => {
+    w.set(x, y, 0).applyMatrix4(h.matrixWorld);
+    const z = supportZ(w.x, w.y, base + 0.3, null, v.type === 'route');
+    return z == null ? 0 : z - base;
+  };
+  P.ribbon.geometry.dispose(); P.ribbon.geometry = ribbonGeometry(v.points, v.width ?? 0.05, zAt);
+  P.hair.geometry.dispose(); P.hair.geometry = new THREE.BufferGeometry().setFromPoints(densify(v.points).map(([x, y]) => new V3(x, y, zAt(x, y) + 0.006)));
+  if (P.arrows) { P.arrows.geometry.dispose(); P.arrows.geometry = arrowGeometry(v.points, 1.6, zAt); }
+}
+function redrapeAll() { drapeEpoch++; for (const [id, h] of userHolders) if (isPoly(store.objects[id])) drapePoly(h, store.objects[id]); requestRender(); }
 
 // =====================================================================
 // Visitor flow: people walk along a route; you can ride along at eye height
@@ -1418,14 +1681,14 @@ function simLoop(now) {
     if (d < 0) { g.visible = false; return; }
     const { p, dir } = pointAlong(r.pts, d % L);
     g.visible = !(sim.follow && i === 0);
-    g.position.set(p[0], p[1], r.z); g.rotation.z = Math.atan2(dir[1], dir[0]);
+    g.position.set(p[0], p[1], supportZ(p[0], p[1], r.z + 0.3, null, true) ?? r.z); g.rotation.z = Math.atan2(dir[1], dir[0]);
   });
   if (sim.follow) {
     const d = (sim.t * speed) % L, { p } = pointAlong(r.pts, d), ahead = pointAlong(r.pts, Math.min(L, d + 1.2));
     const want = new V3(ahead.p[0] - p[0], ahead.p[1] - p[1], 0); if (want.lengthSq() < 1e-6) want.set(...pointAlong(r.pts, d).dir, 0);
     want.normalize(); sim.fwd = sim.fwd ? sim.fwd.lerp(want, 0.08).normalize() : want;
     const yaw = Math.atan2(sim.fwd.y, sim.fwd.x) + sim.lookYaw, f = new V3(Math.cos(yaw) * Math.cos(sim.lookPitch), Math.sin(yaw) * Math.cos(sim.lookPitch), Math.sin(sim.lookPitch));
-    const eye = new V3(p[0], p[1], r.z + prefs.eye / 1000);
+    const eye = new V3(p[0], p[1], (supportZ(p[0], p[1], r.z + 0.3, null, true) ?? r.z) + prefs.eye / 1000);
     nav.dist = 0.3; nav.yaw = Math.atan2(-f.y, -f.x); nav.pitch = Math.asin(-f.z); nav.target.copy(eye).addScaledVector(f, nav.dist); updateCamera();
   }
   requestRender(); requestAnimationFrame(simLoop);
@@ -1727,7 +1990,8 @@ canvas.addEventListener('pointerup', e => {
     }
   }
 });
-// drag-move: slide the selection across the floor plane under the cursor
+// drag-move: slide the selection across the floor plane under the cursor; resting pieces hop onto whatever is under them,
+// hung pieces (posters, monitors) slide along the wall under the cursor
 function startTweak(d) {
   const k = keyOfHolder(d.hit.holder);
   if (!selected.has(k)) setSelection([k], k);
@@ -1735,15 +1999,39 @@ function startTweak(d) {
   d.kind = 'tweak';
   d.plane = new THREE.Plane(new V3(0, 0, 1), -d.hit.point.z); d.p0 = d.hit.point.clone();
   d.start = keys.map(key => { const h = holderOf(key); return { h, pos: h.position.clone() }; });
+  const isObj = key => key.startsWith('objects:'), vOf = key => store.objects[splitKey(key)[1]];
+  d.ground = keys.filter(key => isObj(key) && mountOf(vOf(key)) === 'floor' && !isPoly(vOf(key))).map(holderOf)
+    .sort((a, b) => worldBox(a).min.z - worldBox(b).min.z);
+  const gh = d.hit.holder;
+  if (keys.length === 1 && isObj(k) && mountOf(vOf(k)) === 'wall') {
+    const c = worldBox(gh).getCenter(new V3()), right = new V3(1, 0, 0).applyQuaternion(gh.quaternion).setZ(0).normalize();
+    const exclude = new Set([gh]); for (const [id, h] of userHolders) { const t = store.objects[id]?.type; if (t === 'image' || isPoly({ type: t })) exclude.add(h); }
+    d.wall = { h: gh, zoff: d.p0.z - c.z, xoff: new V3().subVectors(d.p0, c).dot(right), exclude };
+  }
   canvas.style.cursor = 'grabbing';
 }
+function wallDrag(d, e) {
+  const hit = raycastAll(e, { exclude: d.wall.exclude }); if (!hit) return false;
+  const n = hitNormal(hit); if (Math.abs(n.z) > 0.3) return false;
+  if (n.dot(raycaster.ray.direction) > 0) n.negate();
+  const inc = prefs.snapInc / 1000;
+  let cz = hit.point.z - d.wall.zoff; if (snapping()) cz = Math.round(cz / inc) * inc;
+  hangAt(d.wall.h, hit.point, n, cz, d.wall.xoff);
+  liveEdit();
+  const hgt = heightAboveFloor(d.wall.h);
+  setVCB('高さ', fmt(hgt) + ' mm');
+  $('modalText').textContent = `壁に掛ける　床から中心まで ${fmt(hgt)} mm`; $('modalText').classList.remove('hidden');
+  return true;
+}
 function tweakMove(d, e) {
+  if (d.wall && wallDrag(d, e)) return;
   raycaster.setFromCamera(mouseNDC(e), camera);
   const p = raycaster.ray.intersectPlane(d.plane, new V3()); if (!p) return;
   const dv = p.sub(d.p0); dv.z = 0;
   if (e.shiftKey) { if (Math.abs(dv.x) > Math.abs(dv.y)) dv.y = 0; else dv.x = 0; }
   if (snapping()) { const inc = prefs.snapInc / 1000; dv.x = Math.round(dv.x / inc) * inc; dv.y = Math.round(dv.y / inc) * inc; }
   for (const s of d.start) { s.h.position.copy(s.pos).add(dv); s.h.updateMatrixWorld(true); }
+  d.ground.forEach(settle);
   liveEdit();
   setVCB('距離', fmt(dv.length()) + ' mm');
   $('modalText').textContent = `移動  ${fmt(dv.length())} mm（X ${fmt(dv.x)}　Y ${fmt(dv.y)}）　Shiftで縦横にそろえる`; $('modalText').classList.remove('hidden');
@@ -1930,6 +2218,7 @@ function openMenu(items, x, y, title, anchorBtn) {
   if (title) el.innerHTML = `<div class="mt">${title}</div>`;
   for (const it of items) {
     if (it === '-') { el.insertAdjacentHTML('beforeend', '<div class="ms"></div>'); continue; }
+    if (it.head) { const hd = document.createElement('div'); hd.className = 'mt'; hd.textContent = it.head; el.appendChild(hd); continue; }
     const row = document.createElement('div'); row.className = 'mi' + (it.disabled ? ' dis' : '');
     row.innerHTML = `<span></span>${it.shortcut ? `<span class="sc">${it.shortcut}</span>` : ''}`;
     row.firstChild.textContent = it.label;
@@ -1951,12 +2240,17 @@ const addMenu = () => [
   { label: '画像（PNG / JPG）…', action: () => pickFiles('image') },
   { label: '3Dデータ（glb / gltf / obj / fbx / stl）…', action: () => pickFiles('model') },
   { label: '三面図から3Dモデルを作る…', action: threeViewDialog },
+  '-',
+  { head: 'サンプル' },
+  ...SAMPLES.map(sm => ({ label: sm[0], shortcut: sm[1], action: () => addSample(sm) })),
 ];
 const objectMenu = () => [
   { label: '複製', shortcut: 'Shift D', action: duplicateSelected, disabled: !sel() },
   { label: '削除', shortcut: 'X', action: deleteSelected, disabled: !sel() && !selRuler },
   '-',
-  { label: '床に下ろす', action: dropToFloor, disabled: !sel() },
+  { label: '床・台に置く', action: dropToFloor, disabled: !sel() },
+  { label: '壁に掛ける', action: () => setMount('wall'), disabled: !sel() },
+  { label: '浮かせる', action: () => setMount('float'), disabled: !sel() },
   { label: '選択物を3Dカーソルへ', action: selectedToCursor, disabled: !sel() },
   { label: '3Dカーソルを選択物へ', action: cursorToSelected, disabled: !sel() },
   '-',
@@ -2286,10 +2580,20 @@ function renderProps(el) {
   title.querySelector('button').onclick = () => setSelection([], null);
   el.appendChild(title);
 
+  if (v) {
+    // how the piece sits: resting on the floor / a table top, hanging on a wall, or floating where it is
+    const m = mountOf(v), seg = document.createElement('div'); seg.className = 'seg mount-seg';
+    const opts = isPoly(v) ? [['floor', '床に沿わせる'], ['float', '浮かせる']] : [['floor', '床・台に置く'], ['wall', '壁に掛ける'], ['float', '浮かせる']];
+    for (const [k, label] of opts) { const b = document.createElement('button'); b.textContent = label; b.className = m === k ? 'on' : ''; b.onclick = () => setMount(k); seg.appendChild(b); }
+    el.appendChild(prow('置き方', seg));
+    if (m === 'wall' && !isPoly(v)) el.appendChild(prow('高さ', numField({ label: '床から中心', step: 5, get: () => heightAboveFloor(h) * 1000,
+      set: val => { beginEdit([activeKey]); const hh = holderOf(activeKey); hh.position.z += val / 1000 - heightAboveFloor(hh); hh.updateMatrixWorld(true); endEdit('掛ける高さ'); } })));
+  }
   if (v?.type === 'line' || v?.type === 'route') return renderPolyCard(el, c, id, v);
   const dim = (i, label) => xformField(label, hh => dims(hh).getComponent(i) * 1000,
     (hh, val) => { const base = hh.userData.baseBox.getSize(new V3()).getComponent(i); if (base > 1e-6 && val > 0) hh.scale.setComponent(i, Math.sign(hh.scale.getComponent(i) || 1) * val / 1000 / base); }, { step: 5, min: 1 });
-  const loc = (i, label) => xformField(label, hh => hh.position.getComponent(i) * 1000, (hh, val) => hh.position.setComponent(i, val / 1000), { step: 5 });
+  // typing a height lifts a resting piece off its support, so it floats from then on
+  const loc = (i, label) => xformField(label, hh => hh.position.getComponent(i) * 1000, (hh, val) => { hh.position.setComponent(i, val / 1000); if (i === 2 && editing && v && mountOf(v) === 'floor') editing.floatKeys.add(activeKey); }, { step: 5 });
   if (v?.type === 'image') { const st = document.createElement('div'); st.className = 'stack two'; st.append(dim(0, '幅'), dim(2, '高さ')); el.appendChild(prow('寸法', st)); }
   else el.appendChild(prow('寸法', dim(0, '幅'), dim(1, '奥行'), dim(2, '高さ')));
   el.appendChild(prow('位置', loc(0, 'X'), loc(1, 'Y'), loc(2, 'Z')));
@@ -2299,7 +2603,7 @@ function renderProps(el) {
   r90.onclick = () => { beginEdit([activeKey]); const hh = holderOf(activeKey); hh.rotation.z += Math.PI / 2; hh.updateMatrixWorld(true); endEdit('90°回転'); };
   rotRow.append(rot, r90); el.appendChild(prow('回転', rotRow));
 
-  if (v && v.type !== 'model') {
+  if (v && v.type !== 'model' && v.type !== 'kit') {
     const sw = document.createElement('div'); sw.className = 'swatches';
     const setColor = col => commit([{ c, id, v: { ...store.objects[id], color: col } }], '色を変更');
     for (const col of SWATCHES) {
@@ -2314,8 +2618,8 @@ function renderProps(el) {
     // floor signs: lay the picture flat on the floor (or stand it up again)
     const flat = Math.abs((h.rotation.x / DEG) + 90) < 1;
     const b = document.createElement('button'); b.className = 'btn'; b.textContent = flat ? '立てる' : '床に寝かせる（床サイン）';
-    b.onclick = () => { beginEdit([activeKey]); const hh = holderOf(activeKey); if (flat) { hh.rotation.x = 0; } else { hh.rotation.x = -Math.PI / 2; hh.position.z = floorAt(hh.position.x, hh.position.y, hh.position.z + 0.5) + 0.003; } hh.updateMatrixWorld(true); endEdit(flat ? '画像を立てる' : '画像を床に寝かせる'); };
-    el.appendChild(prow('置き方', b));
+    b.onclick = () => { beginEdit([activeKey]); editing.mount = 'floor'; const hh = holderOf(activeKey); hh.rotation.x = flat ? 0 : -Math.PI / 2; hh.updateMatrixWorld(true); endEdit(flat ? '画像を立てる' : '画像を床に寝かせる'); };
+    el.appendChild(prow('サイン', b));
   }
 
   const btns = document.createElement('div'); btns.className = 'btns';

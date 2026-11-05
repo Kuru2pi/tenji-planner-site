@@ -117,6 +117,8 @@ body.plan #navGizmo canvas { display: none; }
 .props-title { display: flex; align-items: center; gap: 8px; }
 .props-title .tf { font-weight: 700; }
 .prow { display: grid; grid-template-columns: 36px 1fr; align-items: center; gap: 8px; }
+.mount-seg { display: flex; width: 100%; }
+.mount-seg button { flex: 1; height: 28px; padding: 0 6px; font-size: 12px; white-space: nowrap; }
 .prow > .pl { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .stack { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
 .stack.two { grid-template-columns: repeat(2, 1fr); }
@@ -173,7 +175,7 @@ select.sf { height: 30px; width: 100%; background: var(--field); color: var(--te
 
 /* ---------- menus ---------- */
 #menuLayer { position: fixed; inset: 0; pointer-events: none; z-index: 100; }
-.menu { position: fixed; min-width: 230px; background: var(--menu); border: 1px solid var(--line); border-radius: 14px; padding: 6px; box-shadow: var(--shadow); pointer-events: auto; }
+.menu { position: fixed; min-width: 230px; background: var(--menu); border: 1px solid var(--line); border-radius: 14px; padding: 6px; box-shadow: var(--shadow); pointer-events: auto; max-height: calc(100vh - 16px); overflow-y: auto; }
 .menu .mt { padding: 4px 10px 6px; color: var(--dim); font-size: 10.5px; font-weight: 700; }
 .menu .mi { display: flex; align-items: center; gap: 8px; padding: 0 10px; white-space: nowrap; cursor: default; height: 34px; border-radius: 8px; }
 .menu .mi:hover:not(.dis) { background: var(--accent-soft); color: var(--accent-strong); }
