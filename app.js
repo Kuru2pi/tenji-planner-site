@@ -27,8 +27,8 @@ const AXIS = { x: new V3(1, 0, 0), y: new V3(0, 1, 0), z: new V3(0, 0, 1) };
 const AXIS_COLOR = { x: '#e5484d', y: '#46a758', z: '#3e7bfa' };
 const SPAWN = new V3(7.885, -16.177, 0.05);                 // original visitor start (Blender axes)
 const BUILDING = new THREE.Box3(new V3(-9, -73, 0), new V3(17, 46, 5));
-const DEFAULT_DELETED = new Set(['whiteBox', 'partition', 'partitionFoot']);
-const ROLE_LABEL = { whiteBox: '白いボックス', partition: '独立壁', partitionFoot: '独立壁の脚' };
+const DEFAULT_DELETED = new Set(['whiteBox', 'partition', 'partitionFoot', 'oldFloor']);
+const ROLE_LABEL = { whiteBox: '白いボックス', partition: '独立壁', partitionFoot: '独立壁の脚', oldFloor: '元の床', floor: '展示床' };
 const PEER_COLORS = ['#ff8a3d', '#4fc3f7', '#9ccc65', '#f06292', '#ffd54f', '#ba68c8', '#4db6ac', '#e57373'];
 const fmt = (m, d = 0) => (Math.round(m * 1000 * 10 ** d) / 10 ** d).toLocaleString('ja-JP', { maximumFractionDigits: d });
 const clone = v => v == null ? null : JSON.parse(JSON.stringify(v));
@@ -1259,7 +1259,9 @@ canvas.addEventListener('pointerdown', e => {
     drag = { kind: 'ruler', a: s.p.clone(), b: s.p.clone(), x: e.clientX, y: e.clientY, moved: false };
     canvas.setPointerCapture(e.pointerId); return;
   }
-  drag = { kind: 'select', x: e.clientX, y: e.clientY, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey };
+  // pressing on an object starts a drag-move once the mouse moves; pressing on empty space starts a box select
+  const grab = (tool === 'select' || tool === 'move') && !e.shiftKey && !(e.ctrlKey || e.metaKey) ? raycastAll(e, { selectable: true }) : null;
+  drag = { kind: 'select', x: e.clientX, y: e.clientY, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, hit: grab };
   canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove', e => {
@@ -1275,7 +1277,9 @@ canvas.addEventListener('pointermove', e => {
   if (drag.kind === 'orbit') { orbit(dx, dy); drag.x = e.clientX; drag.y = e.clientY; }
   else if (drag.kind === 'pan') { pan(dx, dy); drag.x = e.clientX; drag.y = e.clientY; }
   else if (drag.kind === 'zoom') { zoom(Math.pow(1.006, dy)); drag.y = e.clientY; }
+  else if (drag.kind === 'tweak') tweakMove(drag, e);
   else if (drag.kind === 'select') {
+    if (Math.hypot(dx, dy) > 4 && drag.hit) { startTweak(drag); tweakMove(drag, e); return; }
     if (Math.hypot(dx, dy) > 4) {
       const r = viewport.getBoundingClientRect(), el = $('selRect');
       el.classList.remove('hidden');
@@ -1297,6 +1301,9 @@ canvas.addEventListener('pointermove', e => {
 });
 canvas.addEventListener('pointerup', e => {
   const d = drag; drag = null; if (!d) return;
+  if (d.kind === 'tweak') {
+    endEdit('移動'); $('modalText').classList.add('hidden'); setTool(tool); return;
+  }
   if (d.kind === 'select') {
     $('selRect').classList.add('hidden');
     if (d.rect) boxSelect(d, e);
@@ -1328,6 +1335,27 @@ canvas.addEventListener('pointerup', e => {
     }
   }
 });
+// drag-move: slide the selection across the floor plane under the cursor
+function startTweak(d) {
+  const k = keyOfHolder(d.hit.holder);
+  if (!selected.has(k)) setSelection([k], k);
+  const keys = editableKeys(); beginEdit(keys);
+  d.kind = 'tweak';
+  d.plane = new THREE.Plane(new V3(0, 0, 1), -d.hit.point.z); d.p0 = d.hit.point.clone();
+  d.start = keys.map(key => { const h = holderOf(key); return { h, pos: h.position.clone() }; });
+  canvas.style.cursor = 'grabbing';
+}
+function tweakMove(d, e) {
+  raycaster.setFromCamera(mouseNDC(e), camera);
+  const p = raycaster.ray.intersectPlane(d.plane, new V3()); if (!p) return;
+  const dv = p.sub(d.p0); dv.z = 0;
+  if (e.shiftKey) { if (Math.abs(dv.x) > Math.abs(dv.y)) dv.y = 0; else dv.x = 0; }
+  if (snapping()) { const inc = prefs.snapInc / 1000; dv.x = Math.round(dv.x / inc) * inc; dv.y = Math.round(dv.y / inc) * inc; }
+  for (const s of d.start) { s.h.position.copy(s.pos).add(dv); s.h.updateMatrixWorld(true); }
+  liveEdit();
+  setVCB('距離', fmt(dv.length()) + ' mm');
+  $('modalText').textContent = `移動  ${fmt(dv.length())} mm（X ${fmt(dv.x)}　Y ${fmt(dv.y)}）　Shiftで縦横にそろえる`; $('modalText').classList.remove('hidden');
+}
 function boxSelect(d, e) {
   const r = viewport.getBoundingClientRect();
   const x0 = Math.min(d.x, e.clientX) - r.left, x1 = Math.max(d.x, e.clientX) - r.left, y0 = Math.min(d.y, e.clientY) - r.top, y1 = Math.max(d.y, e.clientY) - r.top;
@@ -1560,7 +1588,7 @@ const TOP_MENUS = {
     { label: '自分の名前と色…', action: () => nameDialog() },
   ],
   '追加': addMenu,
-  'ヘルプ': () => [{ label: '操作方法（キーマップ）', action: helpDialog }],
+  'ヘルプ': () => [{ label: '使い方ガイド', action: openManual }, { label: 'キー操作の一覧', action: helpDialog }],
 };
 const VIEW_MENUS = {
   'ビュー': () => [
@@ -1879,6 +1907,7 @@ function renderProps(el) {
     const btns = document.createElement('div'); btns.className = 'btns';
     const mk = (label, fn, cls = '') => { const x = document.createElement('button'); x.className = 'btn ' + cls; x.textContent = label; x.onclick = fn; btns.appendChild(x); };
     mk('床に下ろす', dropToFloor);
+    mk('90°回転', () => { beginEdit([activeKey]); const hh = holderOf(activeKey); hh.rotation.z += Math.PI / 2; hh.updateMatrixWorld(true); endEdit('90°回転'); });
     if (v) mk('複製', duplicateSelected);
     mk('削除', deleteSelected, 'danger');
     if (c === 'space' && store.space[id] && (store.space[id].loc || store.space[id].rot || store.space[id].scale))
@@ -1972,7 +2001,7 @@ function setHints() {
   else if (tool === 'erase') h = [k('クリック', 'オブジェクト・メジャーを削除')];
   else if (tool === 'orbit' || tool === 'pan' || tool === 'zoom') h = [k('ドラッグ', { orbit: '回転', pan: '平行移動', zoom: 'ズーム' }[tool]), k('Space', '選択に戻る')];
   else if (tool === 'measure') h = [k('ドラッグ', '2点間を測る'), k('Ctrl', '吸着の切り替え'), k('Shift', '軸にそろえる'), k('端をドラッグ', '編集'), k('X / Delete', '削除')];
-  else h = [k('左', '選択'), k('中ドラッグ / Alt+左', '視点回転'), k('Shift+中', '平行移動'), k('ホイール', 'ズーム'), k('Shift+右', '3Dカーソル'), k('Shift+A', '追加'), k('G R S', '移動・回転・拡縮')];
+  else h = [k('左', '選択'), k('オブジェクトをドラッグ', '移動'), k('空白をドラッグ', '範囲選択'), k('中ドラッグ / Alt+左', '視点回転'), k('Shift+中', '平行移動'), k('ホイール', 'ズーム'), k('Shift+右', '3Dカーソル'), k('Shift+A', '追加'), k('G R S', '移動・回転・拡縮')];
   $('hints').innerHTML = h.join('');
 }
 function updateStatusCoords(e) { /* cursor readout lives in the status bar's right side */ }
@@ -2116,6 +2145,18 @@ function nameDialog() {
   bg.querySelector('.btn').onclick = ok; inp.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') ok(); };
   document.body.appendChild(bg); inp.focus();
 }
+// user guide (manual.html), shown inside the app
+async function openManual() {
+  const bg = document.createElement('div'); bg.className = 'dialog-bg'; bg.onclick = e => { if (e.target === bg) bg.remove(); };
+  bg.innerHTML = '<div class="dialog manual-dialog"><div class="manual-head"><b>使い方ガイド</b><span class="spacer"></span><button class="btn">閉じる</button></div><div class="manual" id="manualBody">読み込み中…</div></div>';
+  bg.querySelector('.btn').onclick = () => bg.remove();
+  bg.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') bg.remove(); });
+  document.body.appendChild(bg); bg.querySelector('.btn').focus();
+  try {
+    const doc = new DOMParser().parseFromString(await (await fetch('manual.html')).text(), 'text/html');
+    bg.querySelector('#manualBody').replaceChildren(...doc.querySelector('main').childNodes);
+  } catch { bg.querySelector('#manualBody').textContent = '使い方ガイドを読み込めませんでした。'; }
+}
 function helpDialog() {
   const bg = document.createElement('div'); bg.className = 'dialog-bg'; bg.onclick = e => { if (e.target === bg) bg.remove(); };
   const rows = [
@@ -2152,5 +2193,7 @@ renderer.setAnimationLoop(() => render());
 // Start
 // =====================================================================
 renderToolbar(); setHints(); applyClip(); applyLook(); updateCamera(); setVCB('距離', ''); scheduleUI();
+$('helpBtn').onclick = openManual;
+if (!prefs.guideShown) { prefs.guideShown = true; savePrefs(); setTimeout(() => toast('はじめての方は、右上の「？」から使い方ガイドを開けます', 6000), 2500); }
 if (LOCAL || prefs.name) connect(); else nameDialog();
 window.planner = { store, selected, nav, camera: () => camera, holderOf, setSelection, commit, startModal };   // for debugging
