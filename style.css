@@ -62,9 +62,18 @@ body { display: grid; grid-template-rows: 52px 1fr; }
 #viewport canvas.gl { display: block; position: absolute; inset: 0; }
 #labels { position: absolute; inset: 0; pointer-events: none; }
 #modalText { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); padding: 6px 14px; color: var(--accent-ink); background: var(--accent); border-radius: 99px; font-variant-numeric: tabular-nums; font-weight: 600; z-index: 6; white-space: nowrap; box-shadow: var(--shadow); }
-#navGizmo { position: absolute; left: 12px; top: 12px; z-index: 3; }
-#navGizmo canvas { width: 72px; height: 72px; cursor: grab; display: block; }
-body.plan #navGizmo { display: none; }
+#navGizmo { position: absolute; left: 12px; top: 12px; z-index: 3; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+#navGizmo canvas { width: 76px; height: 76px; cursor: grab; display: block; }
+body.plan #navGizmo canvas { display: none; }
+.navrow { display: flex; flex-direction: column; gap: 2px; background: var(--glass); border: 1px solid var(--line); border-radius: 12px; padding: 3px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.navbtn { width: 34px; height: 34px; border-radius: 9px; border: 0; background: transparent; display: grid; place-items: center; color: var(--muted); cursor: grab; }
+.navbtn svg.i { width: 18px; height: 18px; }
+.navbtn:hover { background: var(--field); color: var(--text); }
+.navbtn:active { cursor: grabbing; background: var(--accent-soft); color: var(--accent-strong); }
+#hints { position: absolute; left: 14px; bottom: 18px; display: flex; flex-wrap: wrap; gap: 4px 12px; max-width: calc(50% - 200px); color: var(--muted); font-size: 11px; z-index: 2; pointer-events: none; }
+#hints .k { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+#hints .k b { font-weight: 600; color: var(--text); background: var(--glass); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; font-size: 10px; }
+#topbar > .chip, #topbar > .chip-pair { margin-right: 2px; }
 
 #toolbar { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%); display: flex; gap: 4px; background: var(--glass); backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 16px; padding: 5px; z-index: 3; box-shadow: var(--shadow); }
 .tool { height: 40px; padding: 0 14px 0 11px; border: 0; border-radius: 11px; background: transparent; display: flex; align-items: center; gap: 7px; color: var(--muted); font-weight: 600; white-space: nowrap; }
@@ -205,6 +214,6 @@ body.local #peers { display: none; }
 @media (max-width: 760px) {
   .brand-name { display: none; }
   .seg button { padding: 0 10px; }
-  .tool .t, .tool .k { display: none; }
+  .tool .t, .tool .k, #hints, #topbar > .chip, #topbar > .chip-pair { display: none; }
   .card { left: 10px; right: 10px; width: auto; top: auto; bottom: 76px; max-height: 45%; }
 }

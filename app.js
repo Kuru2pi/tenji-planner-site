@@ -1027,7 +1027,7 @@ const TOOLS = [
   { id: 'extents', tip: '全体表示（Shift+Z／Home）', action: () => frameAll(), icon: '<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>' },
 ];
 // only three tools on screen; the rest stay on their keys (G R S E O Z …)
-const BAR_TOOLS = [['select', '選択・移動'], ['draw', 'ボックスを描く'], ['measure', '測る']];
+const BAR_TOOLS = [['select', '選択・移動'], ['rotate', '回転'], ['draw', 'ボックスを描く'], ['measure', '測る'], ['erase', '消しゴム']];
 function renderToolbar() {
   $('toolbar').innerHTML = BAR_TOOLS.map(([id, label]) => { const t = TOOLS.find(x => x.id === id);
     return `<button class="tool ${tool === id ? 'on' : ''}" data-tool="${id}" title="${t.tip}"><svg class="i" viewBox="0 0 16 16">${t.icon}</svg><span class="t">${label}</span></button>`; }).join('');
@@ -1321,6 +1321,8 @@ canvas.addEventListener('pointermove', e => {
   else if (drag.kind === 'tweak') tweakMove(drag, e);
   else if (drag.kind === 'select') {
     if (Math.hypot(dx, dy) > 4 && drag.hit) { startTweak(drag); tweakMove(drag, e); return; }
+    // dragging empty space moves the view (turns it in 3D, slides the plan); Shift/Ctrl+drag is a box select
+    if (Math.hypot(dx, dy) > 4 && !drag.shift && !drag.ctrl && !drag.rect) { drag.kind = planMode ? 'pan' : 'orbit'; drag.viewDrag = true; drag.x = e.clientX; drag.y = e.clientY; canvas.style.cursor = 'grabbing'; return; }
     if (Math.hypot(dx, dy) > 4) {
       const r = viewport.getBoundingClientRect(), el = $('selRect');
       el.classList.remove('hidden');
@@ -1342,6 +1344,7 @@ canvas.addEventListener('pointermove', e => {
 });
 canvas.addEventListener('pointerup', e => {
   const d = drag; drag = null; if (!d) return;
+  if (d.viewDrag) { canvas.style.cursor = 'default'; return; }
   if (d.kind === 'tweak') {
     endEdit('移動'); $('modalText').classList.add('hidden'); setTool(tool); return;
   }
@@ -1682,6 +1685,7 @@ const moreMenu = () => [
   '-',
   { label: 'キー操作の一覧', action: helpDialog },
 ];
+$('listBtn').onclick = () => { $('leftCol').classList.toggle('hidden'); renderOutliner(); };
 $('moreBtn').onclick = () => { const r = $('moreBtn').getBoundingClientRect(); openMenu(moreMenu(), r.right - 240, r.bottom + 4); };
 $('leftClose').onclick = () => $('leftCol').classList.add('hidden');
 document.addEventListener('pointerdown', e => { const pop = $('settings'); if (!pop.classList.contains('hidden') && !pop.contains(e.target) && !e.target.closest('#menuLayer, #moreBtn')) pop.classList.add('hidden'); });
@@ -2048,7 +2052,8 @@ function setHints() {
   else if (tool === 'erase') h = [k('クリック', 'オブジェクト・メジャーを削除')];
   else if (tool === 'orbit' || tool === 'pan' || tool === 'zoom') h = [k('ドラッグ', { orbit: '回転', pan: '平行移動', zoom: 'ズーム' }[tool]), k('Space', '選択に戻る')];
   else if (tool === 'measure') h = [k('ドラッグ', '2点間を測る'), k('Ctrl', '吸着の切り替え'), k('Shift', '軸にそろえる'), k('端をドラッグ', '編集'), k('X / Delete', '削除')];
-  else h = [k('左', '選択'), k('オブジェクトをドラッグ', '移動'), k('空白をドラッグ', '範囲選択'), k('中ドラッグ / Alt+左', '視点回転'), k('Shift+中', '平行移動'), k('ホイール', 'ズーム'), k('Shift+右', '3Dカーソル'), k('Shift+A', '追加'), k('G R S', '移動・回転・拡縮')];
+  else if (tool === 'rotate') h = [k('物をクリック', '選ぶ'), k('輪をドラッグ', '回す'), k('Ctrl', '5°刻みの切り替え')];
+  else h = [k('物をドラッグ', '移動'), k('何もない所をドラッグ', planMode ? '平行移動' : '視点を回す'), k('Shift+ドラッグ', '範囲選択'), k('ホイール', 'ズーム'), k('Delete', '削除')];
   $('hints').innerHTML = h.join('');
 }
 function updateStatusCoords(e) { /* cursor readout lives in the status bar's right side */ }
@@ -2122,7 +2127,7 @@ function drawGizmo() {
   dragBtn($('navZoom'), (dx, dy) => zoom(Math.pow(1.01, dy)));
   dragBtn($('navPan'), (dx, dy) => pan(dx, dy));
   $('navEye').onclick = eyeView;
-  $('navOrtho').onclick = toggleOrtho;
+  $('navOrtho').onclick = frameAll;
 }
 
 // =====================================================================
