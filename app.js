@@ -357,13 +357,14 @@ loadSpaceBuffer().then(buf => gltfLoader.parseAsync(buf, '')).then(gltf => {
       spaceMeshes.push(o);
       if (!o.geometry.boundsTree) o.geometry.computeBoundsTree();
       const tris = (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3;
-      if (tris < 20000) {   // black outlines on simple geometry (skip dense models like the ducts)
+      if (tris < 20000 && role !== 'floor') {   // black outlines on simple geometry (skip dense models like the ducts, and the floor)
         o.geometry.userData.edges ??= new THREE.EdgesGeometry(o.geometry, 25);
         const line = new THREE.LineSegments(o.geometry.userData.edges, spaceEdgeMat);
         line.raycast = () => {}; line.visible = prefs.edges; o.add(line); spaceEdges.push(line);
       }
       for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
         if (spaceMaterials.has(m)) continue;
+        if (m.map) m.map.anisotropy = renderer.capabilities.getMaxAnisotropy();   // keep floor tiles crisp at grazing angles
         m.clippingPlanes = [clipPlane]; m.side = THREE.DoubleSide; m.polygonOffset = true; m.polygonOffsetFactor = 1; m.polygonOffsetUnits = 1;
         m.userData.origTransparent = m.transparent; m.userData.origOpacity = m.opacity; spaceMaterials.add(m);
       }
