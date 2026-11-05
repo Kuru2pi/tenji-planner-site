@@ -88,7 +88,7 @@ function connect() {
   es.addEventListener('peers', e => { peers = JSON.parse(e.data); renderPeers(); updateRemoteSelection(); });
   es.onerror = () => setConn(false);
 }
-function setConn(on) { const el = $('conn'); el.classList.toggle('on', on); el.textContent = on ? '共有中' : '再接続中…'; }
+function setConn(on) { const el = $('conn'); el.classList.toggle('on', on); el.title = el.textContent = on ? '共有中' : '再接続中…'; }
 
 function send(ops, final = true) {
   if (LOCAL) { if (final) saveLocalDoc(); return; }
@@ -265,6 +265,7 @@ function worldPerPixel(p) {
 }
 function leaveScene() { if (activeScene) { activeScene = null; scheduleUI(); } }
 function orbit(dx, dy) {
+  if (planMode) return pan(dx, dy);   // the plan stays flat: dragging slides it instead
   leaveScene();
   nav.yaw -= dx * 0.006; nav.pitch = THREE.MathUtils.clamp(nav.pitch + dy * 0.006, -Math.PI / 2, Math.PI / 2);
   if (nav.preset && nav.autoOrtho) nav.ortho = false;
@@ -281,6 +282,7 @@ const PRESETS = {
   left: { yaw: 180, pitch: 0, name: '左面' }, top: { yaw: -90, pitch: 90, name: '上面' }, bottom: { yaw: -90, pitch: -90, name: '下面' },
 };
 function setPreset(p) {
+  if (planMode) setPlanMode(false);
   const v = PRESETS[p]; nav.yaw = v.yaw * DEG; nav.pitch = v.pitch * DEG;
   if (!nav.ortho) { nav.ortho = true; nav.autoOrtho = true; } nav.preset = p; updateCamera();
 }
@@ -300,6 +302,7 @@ function frameSelected() {
   if (b.isEmpty()) return frameAll(); frameBox(b);
 }
 function eyeView() {
+  if (planMode) setPlanMode(false);
   nav.ortho = false; nav.preset = null; nav.pitch = 0; nav.yaw = 90 * DEG; nav.dist = 3;
   nav.target.set(SPAWN.x, SPAWN.y - 3, SPAWN.z + prefs.eye / 1000); updateCamera();
 }
@@ -311,7 +314,7 @@ function updateViewInfo() {
 // Clipping / x-ray
 // =====================================================================
 const spaceMaterials = new Set();
-function applyClip() { clipPlane.constant = prefs.clip ? prefs.clipH / 1000 : 1e6; $('clipBtn').classList.toggle('on', prefs.clip); requestRender(); }
+function applyClip() { clipPlane.constant = planMode ? 1.5 : prefs.clip ? prefs.clipH / 1000 : 1e6; $('clipBtn').classList.toggle('on', prefs.clip); requestRender(); }
 function applyXray() {
   for (const m of spaceMaterials) {
     m.transparent = prefs.xray || m.userData.origTransparent; m.opacity = prefs.xray ? 0.3 : m.userData.origOpacity;
@@ -324,6 +327,7 @@ function applyXray() {
 // Existing space (loaded once, overrides come from the shared doc)
 // =====================================================================
 const spaceHolders = new Map();   // key -> holder
+const spaceMeshes = [];
 const A = new THREE.Matrix4().makeRotationX(Math.PI / 2), Ainv = A.clone().invert();
 const draco = new DRACOLoader().setDecoderPath('draco/');   // bundled decoder (works offline and inside the published page)
 const gltfLoader = new GLTFLoader().setDRACOLoader(draco);
@@ -349,6 +353,7 @@ loadSpaceBuffer().then(buf => gltfLoader.parseAsync(buf, '')).then(gltf => {
     holder.userData = { c: 'space', id: n.name, role, base: { loc: holder.position.toArray(), rot: [holder.rotation.x, holder.rotation.y, holder.rotation.z], scale: holder.scale.toArray() } };
     n.traverse(o => {
       if (!o.isMesh) return;
+      spaceMeshes.push(o);
       if (!o.geometry.boundsTree) o.geometry.computeBoundsTree();
       const tris = (o.geometry.index ? o.geometry.index.count : o.geometry.attributes.position.count) / 3;
       if (tris < 20000) {   // black outlines on simple geometry (skip dense models like the ducts)
@@ -367,7 +372,7 @@ loadSpaceBuffer().then(buf => gltfLoader.parseAsync(buf, '')).then(gltf => {
   }
   applyXray();
   for (const key of spaceHolders.keys()) syncSpace(key);
-  $('loading').remove(); refreshPanels(); requestRender();
+  $('loading').remove(); frameAll(); refreshPanels(); requestRender();
 }).catch(err => { $('loading').textContent = '展示空間を読み込めませんでした：' + err.message; });
 
 function localBox(holder) {
@@ -627,7 +632,7 @@ function raycastAll(e, { selectable = false, exclude = null } = {}) {
   raycaster.setFromCamera(mouseNDC(e), camera);
   const roots = [userRoot, spaceRoot];
   const hits = raycaster.intersectObjects(roots, true);
-  const clipZ = prefs.clip ? prefs.clipH / 1000 : Infinity;
+  const clipZ = clipPlane.constant;
   for (const hit of hits) {
     if (!hit.object.isMesh || !visibleChain(hit.object)) continue;
     const h = holderFromObject(hit.object); if (!h) continue;
@@ -730,9 +735,9 @@ function newEntity(fields) {
 }
 
 // ---------- operators ----------
-function addBox(w = prefs.boxW, d = prefs.boxD, hgt = prefs.boxH) {
+function addBox(w = prefs.boxW, d = prefs.boxD, hgt = prefs.boxH, name = 'ボックス', color = '#f2f0ea') {
   const id = rid();
-  const v = newEntity({ type: 'box', name: nextName('ボックス'), scale: [w / 1000, d / 1000, hgt / 1000], color: '#f2f0ea' });
+  const v = newEntity({ type: 'box', name: nextName(name), scale: [w / 1000, d / 1000, hgt / 1000], color });
   commit([{ c: 'objects', id, v }], 'ボックスを追加');
   setSelection(['objects:' + id], 'objects:' + id);
   showLastOp('ボックスを追加', [
@@ -1021,9 +1026,11 @@ const TOOLS = [
   { id: 'zoom', tip: 'ズーム（Z）', icon: '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>' },
   { id: 'extents', tip: '全体表示（Shift+Z／Home）', action: () => frameAll(), icon: '<path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4"/>' },
 ];
+// only three tools on screen; the rest stay on their keys (G R S E O Z …)
+const BAR_TOOLS = [['select', '選択・移動'], ['draw', 'ボックスを描く'], ['measure', '測る']];
 function renderToolbar() {
-  $('toolbar').innerHTML = TOOLS.map(t => t === 'sep' ? '<div class="sep"></div>' :
-    `<button class="tool ${tool === t.id ? 'on' : ''}" data-tool="${t.id}" data-tip="${t.tip}"><svg class="i" viewBox="0 0 16 16">${t.icon}</svg></button>`).join('');
+  $('toolbar').innerHTML = BAR_TOOLS.map(([id, label]) => { const t = TOOLS.find(x => x.id === id);
+    return `<button class="tool ${tool === id ? 'on' : ''}" data-tool="${id}" title="${t.tip}"><svg class="i" viewBox="0 0 16 16">${t.icon}</svg><span class="t">${label}</span></button>`; }).join('');
   $('toolbar').querySelectorAll('.tool').forEach(b => b.onclick = () => { const t = TOOLS.find(x => x.id === b.dataset.tool); t.action ? t.action() : setTool(t.id); });
 }
 function setTool(t) {
@@ -1057,7 +1064,8 @@ function applyLook() {
   const t = THEMES[prefs.theme] || THEMES.light;
   document.documentElement.dataset.theme = prefs.theme;
   for (const k of ['zenith', 'horizon', 'ground', 'groundFar']) skyMat.uniforms[k].value.set(t[k]);
-  sky.visible = prefs.sky; scene.background = prefs.sky ? null : new THREE.Color(prefs.theme === 'dark' ? 0x2a2c30 : 0xe6e3dd);
+  sky.visible = prefs.sky && !planMode;
+  scene.background = planMode ? new THREE.Color(0xfbfaf8) : prefs.sky ? null : new THREE.Color(prefs.theme === 'dark' ? 0x2a2c30 : 0xe6e3dd);
   rulerMat.color.set(t.ruler); dotMat.color.set(t.ruler);
   outlineSel.visibleEdgeColor.set(t.sel); outlineSel.hiddenEdgeColor.set(t.sel).multiplyScalar(0.4);
   outlineAct.visibleEdgeColor.set(t.act); outlineAct.hiddenEdgeColor.set(t.act).multiplyScalar(0.4);
@@ -1066,6 +1074,38 @@ function applyLook() {
   requestRender(); scheduleUI();
 }
 function toggleTheme() { prefs.theme = prefs.theme === 'dark' ? 'light' : 'dark'; savePrefs(); applyLook(); }
+
+// =====================================================================
+// Plan view: flat top-down drawing; the space is cut at 1.5 m and cut walls read as solid black
+// =====================================================================
+let planMode = false, nav3d = null;
+const planFill = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide, clippingPlanes: [clipPlane], polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+planFill.onBeforeCompile = sh => { sh.fragmentShader = sh.fragmentShader.replace('#include <dithering_fragment>', '#include <dithering_fragment>\n  if (!gl_FrontFacing) gl_FragColor = vec4(vec3(0.05), 1.0);'); };
+const planFloor = new THREE.MeshBasicMaterial({ color: 0xefede7, clippingPlanes: [clipPlane], polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 });
+function setPlanMode(on) {
+  if (on === planMode) return;
+  planMode = on; document.body.classList.toggle('plan', on);
+  document.querySelectorAll('#viewSeg button').forEach(b => b.classList.toggle('on', (b.dataset.view === 'plan') === on));
+  for (const m of spaceMeshes) {
+    // floors would hide the wall bottoms seen from above, so the plan is drawn on plain paper instead
+    const floor = holderFromObject(m)?.userData.role === 'floor';
+    if (on) { m.userData.mat3d = m.material; m.material = planFill; if (floor) m.visible = false; }
+    else { if (m.userData.mat3d) m.material = m.userData.mat3d; m.visible = true; }
+  }
+  helperRoot.visible = !on;
+  if (on) {
+    nav3d = navSnapshot();
+    // same orientation as the venue drawing: corridor on the left, gallery on the right
+    nav.yaw = Math.PI; nav.pitch = Math.PI / 2; nav.ortho = true; nav.autoOrtho = false; nav.preset = 'top';
+    nav.target.set(4, -14, 0);
+    const half = Math.max(64 * viewport.clientHeight / Math.max(1, viewport.clientWidth), 16);
+    nav.dist = half / Math.tan(persp.fov * DEG / 2);
+  } else if (nav3d) {
+    nav.target.fromArray(nav3d.target); Object.assign(nav, { dist: nav3d.dist, yaw: nav3d.yaw, pitch: nav3d.pitch, ortho: nav3d.ortho, preset: nav3d.preset }); persp.fov = nav3d.fov;
+  }
+  applyClip(); applyLook(); updateCamera(); setHints();
+}
+document.querySelectorAll('#viewSeg button').forEach(b => b.onclick = () => setPlanMode(b.dataset.view === 'plan'));
 
 // =====================================================================
 // Measurements box (bottom right, like a value control box)
@@ -1271,6 +1311,7 @@ canvas.addEventListener('pointermove', e => {
   if (!drag) {
     if (tool === 'draw' && draw) { drawMove(e); return; }
     if (tool === 'measure' || tool === 'draw' || tool === 'cursor') showSnapMark(snapSurface(e, snapping()));
+    else if (tool === 'select' || tool === 'move') canvas.style.cursor = raycastAll(e, { selectable: true }) ? 'grab' : 'default';   // show what can be dragged
     return;
   }
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
@@ -1504,7 +1545,7 @@ window.addEventListener('keydown', e => {
   if (k === 'KeyZ' && e.altKey) { prefs.xray = !prefs.xray; savePrefs(); return applyXray(); }
   if (k === 'KeyC' && e.shiftKey) { setCursor(new V3(SPAWN.x, SPAWN.y - 4, 0.09)); return frameAll(); }
   if (k === 'F2') { e.preventDefault(); return renameActive(); }
-  if (k === 'Space') { e.preventDefault(); return setTool('select'); }
+  if (k === 'Space' || k === 'KeyV') { e.preventDefault(); return setTool('select'); }
   if (k === 'KeyM') return setTool('move');
   if (k === 'KeyE') return setTool('erase');
   if (k === 'KeyB') return setTool('draw');
@@ -1548,7 +1589,10 @@ function openMenu(items, x, y, title, anchorBtn) {
 document.addEventListener('pointerdown', e => { if (openMenuEl && !openMenuEl.contains(e.target) && !e.target.closest('.mbtn')) closeMenus(); }, true);
 const sel = () => selected.size > 0;
 const addMenu = () => [
-  { label: 'ボックス（立方体）', action: () => addBox() },
+  { label: 'ボックス', action: () => addBox() },
+  { label: '可動壁（3640 × 940 × 2700）', action: () => addBox(3640, 940, 2700, '可動壁', '#9a9894') },
+  { label: 'ボックスを描く', shortcut: 'B', action: () => setTool('draw') },
+  '-',
   { label: '画像（PNG / JPG）…', action: () => pickFiles('image') },
   { label: '3Dデータ（glb / gltf / obj / fbx / stl）…', action: () => pickFiles('model') },
 ];
@@ -1624,8 +1668,24 @@ function buildMenuBar(el, menus) {
     el.appendChild(b);
   }
 }
-buildMenuBar($('topMenus'), { 'ファイル': TOP_MENUS['ファイル'], '編集': TOP_MENUS['編集'], '表示': VIEW_MENUS['ビュー'], '選択': VIEW_MENUS['選択'], 'オブジェクト': VIEW_MENUS['オブジェクト'], 'ヘルプ': TOP_MENUS['ヘルプ'] });
-$('addBtn').onclick = () => { const r = $('addBtn').getBoundingClientRect(); openMenu(addMenu(), r.left, r.bottom + 4, '追加'); };
+const moreMenu = () => [
+  { label: 'オブジェクト一覧（削除した壁・床も）', action: () => { $('leftCol').classList.remove('hidden'); renderOutliner(); } },
+  { label: '表示とスナップの設定', action: () => $('settings').classList.toggle('hidden') },
+  '-',
+  { label: '全体を表示', shortcut: 'Home', action: frameAll },
+  { label: '目線で見る（スタート地点）', shortcut: '0', action: () => { setPlanMode(false); eyeView(); } },
+  { label: '歩いて見る（ウォーク）', shortcut: 'Shift `', action: () => { setPlanMode(false); enterWalk(); } },
+  '-',
+  { label: '画像・3Dデータを読み込む…', action: () => pickFiles('all') },
+  ...(LOCAL ? [{ label: '配置をすべて消す', action: clearLayout }]
+    : [{ label: 'バックアップを保存（JSON）', shortcut: 'Ctrl S', action: saveBackup }, { label: 'バックアップから復元…', action: () => $('jsonIn').click() }, { label: '配置一覧をCSVで書き出し', action: exportCSV }]),
+  '-',
+  { label: 'キー操作の一覧', action: helpDialog },
+];
+$('moreBtn').onclick = () => { const r = $('moreBtn').getBoundingClientRect(); openMenu(moreMenu(), r.right - 240, r.bottom + 4); };
+$('leftClose').onclick = () => $('leftCol').classList.add('hidden');
+document.addEventListener('pointerdown', e => { const pop = $('settings'); if (!pop.classList.contains('hidden') && !pop.contains(e.target) && !e.target.closest('#menuLayer, #moreBtn')) pop.classList.add('hidden'); });
+$('addBtn').onclick = () => { const r = $('addBtn').getBoundingClientRect(); openMenu(addMenu(), r.left, r.bottom + 4); };
 $('undoBtn').onclick = undo; $('redoBtn').onclick = redo; $('themeBtn').onclick = toggleTheme;
 
 // =====================================================================
@@ -1737,6 +1797,7 @@ const closedPanels = new Set();
 let lastOp = null;
 function showLastOp(title, defs) { lastOp = { title, defs }; renderLastOp(); }
 function renderLastOp() {
+  return $('lastOp').classList.add('hidden');   // the selection card covers this in the simple layout
   const el = $('lastOp');
   if (!lastOp) return el.classList.add('hidden');
   el.classList.remove('hidden'); $('lastOpTitle').textContent = lastOp.title;
@@ -1850,71 +1911,57 @@ function renameActive() {
 }
 
 function renderRight() {
-  document.body.classList.toggle('no-right', !prefs.rightPanel);
-  document.body.classList.toggle('no-left', !prefs.leftPanel);
-  document.querySelectorAll('.rtab').forEach(b => b.classList.toggle('on', b.dataset.tab === rightTab));
+  const show = !!(activeKey && holderOf(activeKey));
+  $('rightCol').classList.toggle('hidden', !show);
   const el = $('rightBody'); el.innerHTML = '';
-  if (rightTab === 'props') renderProps(el);
-  else if (rightTab === 'measure') renderMeasure(el);
-  else renderViewTab(el);
+  if (show) renderProps(el);
 }
-document.querySelectorAll('.rtab').forEach(b => b.onclick = () => { rightTab = b.dataset.tab; renderRight(); });
 
-function newBoxPanel() {
-  return panel('新しいボックスの寸法', b => {
-    const f = (label, key) => numField({ label, compact: true, get: () => prefs[key], set: v => { prefs[key] = Math.max(1, Math.round(v)); savePrefs(); }, step: 5, min: 1 });
-    b.appendChild(prow('寸法', f('W', 'boxW'), f('D', 'boxD'), f('H', 'boxH')));
-    const bt = document.createElement('div'); bt.className = 'btns';
-    bt.innerHTML = '<button class="btn primary">3Dカーソルに追加</button><button class="btn">ボックスを描く（B）</button>';
-    bt.children[0].onclick = () => addBox(); bt.children[1].onclick = () => setTool('draw'); b.appendChild(bt);
-  }, 'p-newbox');
-}
+// selection card: only what you need to place a piece — size, position, angle, colour
+const SWATCHES = ['#f2f0ea', '#ffffff', '#9a9894', '#3a3936', '#c9a77c', '#7d8f6a', '#5b5bd6'];
 function renderProps(el) {
-  if (!activeKey || !holderOf(activeKey)) {
-    el.insertAdjacentHTML('beforeend', '<div class="empty">オブジェクトを選択すると<br>寸法や色を編集できます</div>');
-    el.appendChild(newBoxPanel()); return;
-  }
   const [c, id] = splitKey(activeKey), h = holderOf(activeKey), v = c === 'objects' ? store.objects[id] : null;
   const title = document.createElement('div'); title.className = 'props-title';
-  title.innerHTML = ico(v ? (v.type === 'box' ? 'box' : v.type === 'image' ? 'image' : 'model') : 'box', v ? { box: 'box', image: 'img', model: 'mdl' }[v.type] : '') + '<input class="tf">';
+  title.innerHTML = '<input class="tf"><button class="icon-btn" title="選択を解除（Esc）">✕</button>';
   const nameIn = title.querySelector('input'); nameIn.value = v ? v.name : displayName(activeKey); nameIn.disabled = !v;
   nameIn.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') nameIn.blur(); };
   nameIn.onchange = () => { const n = nameIn.value.trim(); if (v && n) commit([{ c, id, v: { ...store.objects[id], name: n } }], '名前を変更'); };
+  title.querySelector('button').onclick = () => setSelection([], null);
   el.appendChild(title);
-  el.appendChild(panel('位置・回転・大きさ', b => transformRows(b), 'p-xform'));
-  if (v) el.appendChild(panel('色・質感', b => {
-    if (v.type !== 'model') {
-      const col = document.createElement('input'); col.type = 'color'; col.className = 'cf'; col.value = v.color || '#ffffff';
-      let before = null;
-      col.oninput = () => { before ??= clone(store.objects[id]); const nv = { ...store.objects[id], color: col.value }; setLocal({ c, id, v: nv }); send([{ c, id, v: nv }], false); };
-      col.onchange = () => { const nv = { ...store.objects[id], color: col.value }; send([{ c, id, v: nv }]); pushUndo('色を変更', [{ c, id, v: before }], [{ c, id, v: nv }]); before = null; };
-      b.appendChild(prow(v.type === 'image' ? '色味' : '色', col));
+
+  const dim = (i, label) => xformField(label, hh => dims(hh).getComponent(i) * 1000,
+    (hh, val) => { const base = hh.userData.baseBox.getSize(new V3()).getComponent(i); if (base > 1e-6 && val > 0) hh.scale.setComponent(i, Math.sign(hh.scale.getComponent(i) || 1) * val / 1000 / base); }, { step: 5, min: 1 });
+  const loc = (i, label) => xformField(label, hh => hh.position.getComponent(i) * 1000, (hh, val) => hh.position.setComponent(i, val / 1000), { step: 5 });
+  if (v?.type === 'image') { const st = document.createElement('div'); st.className = 'stack two'; st.append(dim(0, '幅'), dim(2, '高さ')); el.appendChild(prow('寸法', st)); }
+  else el.appendChild(prow('寸法', dim(0, '幅'), dim(1, '奥行'), dim(2, '高さ')));
+  el.appendChild(prow('位置', loc(0, 'X'), loc(1, 'Y'), loc(2, 'Z')));
+  const rotRow = document.createElement('div'); rotRow.className = 'stack two';
+  const rot = xformField('角度', hh => hh.rotation.z / DEG, (hh, val) => { hh.rotation.z = val * DEG; }, { unit: '°', digits: 1, step: 0.5 });
+  const r90 = document.createElement('button'); r90.className = 'btn'; r90.textContent = '90° 回す';
+  r90.onclick = () => { beginEdit([activeKey]); const hh = holderOf(activeKey); hh.rotation.z += Math.PI / 2; hh.updateMatrixWorld(true); endEdit('90°回転'); };
+  rotRow.append(rot, r90); el.appendChild(prow('回転', rotRow));
+
+  if (v && v.type !== 'model') {
+    const sw = document.createElement('div'); sw.className = 'swatches';
+    const setColor = col => commit([{ c, id, v: { ...store.objects[id], color: col } }], '色を変更');
+    for (const col of SWATCHES) {
+      const b = document.createElement('button'); b.className = 'swatch' + ((v.color || '').toLowerCase() === col ? ' on' : ''); b.style.background = col; b.title = col; b.onclick = () => setColor(col); sw.appendChild(b);
     }
-    b.appendChild(prow('不透明', numField({ label: '', unit: '', digits: 2, step: 0.01, min: 0.05, get: () => store.objects[id]?.opacity ?? 1,
-      set: val => commit([{ c, id, v: { ...store.objects[id], opacity: Math.min(1, Math.max(0.05, val)) } }], '透明度を変更'),
-      live: val => { const nv = { ...store.objects[id], opacity: Math.min(1, Math.max(0.05, val)) }; setLocal({ c, id, v: nv }); send([{ c, id, v: nv }], false); },
-      begin: () => { lastOpacityBefore = clone(store.objects[id]); },
-      end: () => { if (lastOpacityBefore) { send([{ c, id, v: store.objects[id] }]); pushUndo('透明度を変更', [{ c, id, v: lastOpacityBefore }], [{ c, id, v: store.objects[id] }]); lastOpacityBefore = null; } } })));
-    if (v.type === 'image') b.insertAdjacentHTML('beforeend', `<div class="note">${v.asset.name}（${v.asset.w}×${v.asset.h} px）</div>`);
-    if (v.type === 'model') b.insertAdjacentHTML('beforeend', '<div class="note">色・テクスチャは読み込んだファイルのものを使います。</div>');
-  }, 'p-surface'));
-  if (v?.type === 'model') el.appendChild(panel('読み込み設定', b => { b.appendChild(prow('単位', fieldFor(unitDef(id)))); b.appendChild(fieldFor(yupDef(id))); }, 'p-import'));
-  el.appendChild(panel('情報', b => {
-    const info = document.createElement('div'); info.className = 'note';
-    if (v) info.textContent = `種類：${{ box: 'ボックス', image: '画像', model: '3Dデータ' }[v.type]}\n作成：${v.by || '—'}${v.asset ? '\nファイル：' + v.asset.name : ''}`;
-    else info.textContent = `既存の展示空間オブジェクト${h.userData.role ? '\n分類：' + ROLE_LABEL[h.userData.role] : ''}`;
-    info.style.whiteSpace = 'pre-line'; b.appendChild(info);
-    const btns = document.createElement('div'); btns.className = 'btns';
-    const mk = (label, fn, cls = '') => { const x = document.createElement('button'); x.className = 'btn ' + cls; x.textContent = label; x.onclick = fn; btns.appendChild(x); };
-    mk('床に下ろす', dropToFloor);
-    mk('90°回転', () => { beginEdit([activeKey]); const hh = holderOf(activeKey); hh.rotation.z += Math.PI / 2; hh.updateMatrixWorld(true); endEdit('90°回転'); });
-    if (v) mk('複製', duplicateSelected);
-    mk('削除', deleteSelected, 'danger');
-    if (c === 'space' && store.space[id] && (store.space[id].loc || store.space[id].rot || store.space[id].scale))
-      mk('位置を元に戻す', () => { const o = { ...store.space[id] }; delete o.loc; delete o.rot; delete o.scale; commit([{ c, id, v: o }], '位置を元に戻す'); });
-    b.appendChild(btns);
-  }, 'p-info'));
+    const custom = document.createElement('input'); custom.type = 'color'; custom.className = 'swatch-custom'; custom.value = v.color || '#ffffff'; custom.title = 'ほかの色';
+    custom.onchange = () => setColor(custom.value); sw.appendChild(custom);
+    el.appendChild(prow('色', sw));
+  }
+  if (v?.type === 'model') el.appendChild(prow('単位', fieldFor(unitDef(id))));
+
+  const btns = document.createElement('div'); btns.className = 'btns';
+  const mk = (label, fn, cls = '') => { const x = document.createElement('button'); x.className = 'btn ' + cls; x.textContent = label; x.onclick = fn; btns.appendChild(x); };
+  if (v) mk('複製', duplicateSelected);
+  mk('削除', deleteSelected, 'danger');
+  if (c === 'space' && store.space[id] && (store.space[id].loc || store.space[id].rot || store.space[id].scale))
+    mk('元の位置に戻す', () => { const o = { ...store.space[id] }; delete o.loc; delete o.rot; delete o.scale; commit([{ c, id, v: o }], '位置を元に戻す'); });
+  el.appendChild(btns);
 }
+
 let lastOpacityBefore = null;
 
 function transformRows(b) {
@@ -2056,7 +2103,7 @@ function drawGizmo() {
   gz.addEventListener('pointermove', e => { if (!gd) return; const dx = e.clientX - gd.x, dy = e.clientY - gd.y; if (Math.abs(dx) + Math.abs(dy) > 2) gd.moved = true; if (gd.moved) { orbit(dx, dy); gd.x = e.clientX; gd.y = e.clientY; } });
   gz.addEventListener('pointerup', e => {
     if (gd && !gd.moved) {
-      const r = gz.getBoundingClientRect(), x = (e.clientX - r.left) * 2, y = (e.clientY - r.top) * 2;
+      const r = gz.getBoundingClientRect(), x = (e.clientX - r.left) * gz.width / r.width, y = (e.clientY - r.top) * gz.height / r.height;
       const hit = [...gizmoHits].reverse().find(it => Math.hypot(it.x - x, it.y - y) < 16);
       if (hit) {
         const map = { 'x1': 'right', 'x-1': 'left', 'y1': 'back', 'y-1': 'front', 'z1': 'top', 'z-1': 'bottom' };
